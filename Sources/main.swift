@@ -89,7 +89,11 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         self.window = window
 
-        let contentView = NSView(frame: window.contentView!.bounds)
+        guard let windowContentView = window.contentView else {
+            print("Error: Failed to initialize window content view")
+            return
+        }
+        let contentView = NSView(frame: windowContentView.bounds)
 
         let labelWidth: CGFloat = 110
         let fieldX: CGFloat = 130
@@ -109,7 +113,9 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         nameField?.placeholderString = "My App"
         nameField?.font = NSFont.systemFont(ofSize: 13)
         nameField?.bezelStyle = .roundedBezel
-        contentView.addSubview(nameField!)
+        if let field = nameField {
+            contentView.addSubview(field)
+        }
 
         currentY -= rowHeight
 
@@ -121,11 +127,13 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         contentView.addSubview(portLabel)
 
         portField = NSTextField(frame: NSRect(x: fieldX, y: currentY - 2, width: 80, height: 24))
-        portField?.stringValue = project != nil ? "\(project!.port)" : ""
+        portField?.stringValue = project.map { "\($0.port)" } ?? ""
         portField?.placeholderString = "3000"
         portField?.font = NSFont.systemFont(ofSize: 13)
         portField?.bezelStyle = .roundedBezel
-        contentView.addSubview(portField!)
+        if let field = portField {
+            contentView.addSubview(field)
+        }
 
         currentY -= rowHeight
 
@@ -141,7 +149,9 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         directoryField?.placeholderString = "~/Projects/my-app"
         directoryField?.font = NSFont.systemFont(ofSize: 13)
         directoryField?.bezelStyle = .roundedBezel
-        contentView.addSubview(directoryField!)
+        if let field = directoryField {
+            contentView.addSubview(field)
+        }
 
         let browseButton = NSButton(frame: NSRect(x: fieldX + fieldWidth - 44, y: currentY - 3, width: 44, height: 26))
         browseButton.title = "..."
@@ -165,7 +175,9 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         startCommandField?.placeholderString = "npm run dev"
         startCommandField?.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         startCommandField?.bezelStyle = .roundedBezel
-        contentView.addSubview(startCommandField!)
+        if let field = startCommandField {
+            contentView.addSubview(field)
+        }
 
         // Buttons
         let cancelButton = NSButton(frame: NSRect(x: 280, y: 16, width: 90, height: 32))
