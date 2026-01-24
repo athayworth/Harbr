@@ -399,36 +399,44 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
     // MARK: Terminal Helpers
 
+    /// Escapes a string for safe use in shell commands within single quotes.
+    /// Handles single quotes by ending the quoted string, adding an escaped quote, and starting a new quoted string.
+    private func shellEscape(_ string: String) -> String {
+        return string.replacingOccurrences(of: "'", with: "'\\''")
+    }
+
     /// Opens a terminal window in the specified directory, optionally running a command.
-    func openTerminal(directory: String, command: String? = nil, activate: Bool = true) {
+    @MainActor func openTerminal(directory: String, command: String? = nil, activate: Bool = true) {
         let terminal = config?.terminal ?? .terminal
+        let safeDirectory = shellEscape(directory)
+        let safeCommand = command.map { shellEscape($0) }
 
         let script: String
         switch terminal {
         case .terminal:
-            if let cmd = command {
+            if let cmd = safeCommand {
                 script = """
                 tell application "Terminal"
-                    do script "cd '\(directory)' && \(cmd)"
+                    do script "cd '\(safeDirectory)' && \(cmd)"
                     \(activate ? "activate" : "")
                 end tell
                 """
             } else {
                 script = """
                 tell application "Terminal"
-                    do script "cd '\(directory)'"
+                    do script "cd '\(safeDirectory)'"
                     \(activate ? "activate" : "")
                 end tell
                 """
             }
 
         case .iterm:
-            if let cmd = command {
+            if let cmd = safeCommand {
                 script = """
                 tell application "iTerm"
                     create window with default profile
                     tell current session of current window
-                        write text "cd '\(directory)' && \(cmd)"
+                        write text "cd '\(safeDirectory)' && \(cmd)"
                     end tell
                     \(activate ? "activate" : "")
                 end tell
@@ -438,7 +446,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 tell application "iTerm"
                     create window with default profile
                     tell current session of current window
-                        write text "cd '\(directory)'"
+                        write text "cd '\(safeDirectory)'"
                     end tell
                     \(activate ? "activate" : "")
                 end tell
@@ -447,14 +455,14 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         case .warp:
             // Warp uses a different approach - open via URL scheme or direct launch
-            if let cmd = command {
+            if let cmd = safeCommand {
                 script = """
                 tell application "Warp"
                     \(activate ? "activate" : "")
                 end tell
                 delay 0.5
                 tell application "System Events"
-                    keystroke "cd '\(directory)' && \(cmd)"
+                    keystroke "cd '\(safeDirectory)' && \(cmd)"
                     key code 36
                 end tell
                 """
@@ -465,7 +473,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 end tell
                 delay 0.5
                 tell application "System Events"
-                    keystroke "cd '\(directory)'"
+                    keystroke "cd '\(safeDirectory)'"
                     key code 36
                 end tell
                 """
@@ -476,7 +484,12 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         if let scriptObject = NSAppleScript(source: script) {
             scriptObject.executeAndReturnError(&error)
             if let error = error {
+                let errorMessage = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
                 print("AppleScript error: \(error)")
+                showAlert(
+                    title: "Failed to Open Terminal",
+                    message: "Could not open \(terminal.displayName): \(errorMessage)"
+                )
             }
         }
     }
@@ -586,11 +599,15 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     func updateResourceCache() {
         guard let config = config else { return }
 
+        // Capture previous states on main thread to avoid data race
+        let capturedPreviousStates = self.previousPortStates
+        let projectsCopy = config.projects
+
         DispatchQueue.global(qos: .background).async { [weak self] in
             var newCache: [Int: PortStatus] = [:]
             var stateChanges: [(project: Project, started: Bool)] = []
 
-            for project in config.projects {
+            for project in projectsCopy {
                 let isActive = self?.isPortActive(project.port) ?? false
                 var cpu: Double? = nil
                 var mem: Double? = nil
@@ -602,8 +619,8 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
                 newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem)
 
-                // Check for state change
-                if let previousState = self?.previousPortStates[project.port] {
+                // Check for state change using captured snapshot
+                if let previousState = capturedPreviousStates[project.port] {
                     if previousState != isActive {
                         stateChanges.append((project: project, started: isActive))
                     }
@@ -614,7 +631,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
 
                 // Update previous states
-                for project in config.projects {
+                for project in projectsCopy {
                     self.previousPortStates[project.port] = newCache[project.port]?.isActive ?? false
                 }
 
@@ -863,7 +880,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         if !output.isEmpty {
-            let pids = output.components(separatedBy: "\n")
+            let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
             for pid in pids {
                 let killTask = Process()
                 killTask.launchPath = "/bin/kill"
@@ -917,7 +934,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
                 if !output.isEmpty {
-                    let pids = output.components(separatedBy: "\n")
+                    let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
                     for pid in pids {
                         let killTask = Process()
                         killTask.launchPath = "/bin/kill"
@@ -993,16 +1010,21 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     }
 
     @MainActor @objc func editProject(_ sender: NSMenuItem) {
-        guard let project = sender.representedObject as? Project,
-              let index = config?.projects.firstIndex(where: { $0.name == project.name && $0.port == project.port }) else {
+        guard let project = sender.representedObject as? Project else {
             return
         }
 
+        let originalPort = project.port
+
         currentEditorWindow = ProjectEditorWindow(project: project) { [weak self] name, port, directory, startCommand in
+            guard let self = self,
+                  let index = self.config?.projects.firstIndex(where: { $0.port == originalPort }) else {
+                return
+            }
             let updatedProject = Project(name: name, port: port, directory: directory, startCommand: startCommand)
-            self?.config?.projects[index] = updatedProject
-            self?.saveConfig()
-            self?.currentEditorWindow = nil
+            self.config?.projects[index] = updatedProject
+            self.saveConfig()
+            self.currentEditorWindow = nil
         }
         currentEditorWindow?.onCancel = { [weak self] in
             self?.currentEditorWindow = nil
