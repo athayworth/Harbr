@@ -884,7 +884,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
             for pid in pids {
                 let killTask = Process()
                 killTask.launchPath = "/bin/kill"
-                killTask.arguments = [pid]
+                killTask.arguments = ["-9", pid]
                 killTask.launch()
                 killTask.waitUntilExit()
             }
@@ -938,7 +938,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                     for pid in pids {
                         let killTask = Process()
                         killTask.launchPath = "/bin/kill"
-                        killTask.arguments = [pid]
+                        killTask.arguments = ["-9", pid]
                         killTask.launch()
                         killTask.waitUntilExit()
                     }
