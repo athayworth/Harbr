@@ -740,6 +740,11 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 stopItem.representedObject = project
                 stopItem.target = self
                 submenu.addItem(stopItem)
+
+                let restartItem = NSMenuItem(title: "Restart", action: #selector(restartProject(_:)), keyEquivalent: "")
+                restartItem.representedObject = project
+                restartItem.target = self
+                submenu.addItem(restartItem)
             } else {
                 let startItem = NSMenuItem(title: "Start", action: #selector(startProject(_:)), keyEquivalent: "")
                 startItem.representedObject = project
@@ -865,13 +870,17 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
     @MainActor @objc func stopProject(_ sender: NSMenuItem) {
         guard let project = sender.representedObject as? Project else { return }
+        stopProjectByPort(project.port)
+    }
 
+    @MainActor func stopProjectByPort(_ port: Int) {
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
-        task.arguments = ["-t", "-i", ":\(project.port)"]
+        task.arguments = ["-t", "-i", ":\(port)"]
 
         let pipe = Pipe()
         task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
 
         task.launch()
         task.waitUntilExit()
@@ -881,6 +890,38 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         if !output.isEmpty {
             let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
+            var pgids = Set<String>()
+
+            // Get process group IDs for all PIDs
+            for pid in pids {
+                let pgidTask = Process()
+                pgidTask.launchPath = "/bin/ps"
+                pgidTask.arguments = ["-o", "pgid=", "-p", pid]
+
+                let pgidPipe = Pipe()
+                pgidTask.standardOutput = pgidPipe
+                pgidTask.standardError = FileHandle.nullDevice
+
+                pgidTask.launch()
+                pgidTask.waitUntilExit()
+
+                let pgidData = pgidPipe.fileHandleForReading.readDataToEndOfFile()
+                if let pgid = String(data: pgidData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !pgid.isEmpty {
+                    pgids.insert(pgid)
+                }
+            }
+
+            // Kill entire process groups (negative PGID kills the whole group)
+            for pgid in pgids {
+                let killTask = Process()
+                killTask.launchPath = "/bin/kill"
+                killTask.arguments = ["-9", "-\(pgid)"]
+                killTask.launch()
+                killTask.waitUntilExit()
+            }
+
+            // Also kill individual PIDs as fallback (in case group kill had permission issues)
             for pid in pids {
                 let killTask = Process()
                 killTask.launchPath = "/bin/kill"
@@ -891,6 +932,23 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
             // Wait a moment then refresh
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.updateMenu()
+            }
+        }
+    }
+
+    @MainActor @objc func restartProject(_ sender: NSMenuItem) {
+        guard let project = sender.representedObject as? Project else { return }
+
+        // Stop first
+        stopProjectByPort(project.port)
+
+        // Wait for processes to fully terminate, then start
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.openTerminal(directory: project.directory, command: project.startCommand)
+
+            // Refresh menu after another moment
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 self?.updateMenu()
             }
         }
@@ -920,29 +978,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         for project in config.projects {
             let status = portStatusCache[project.port]
             if status?.isActive == true {
-                let task = Process()
-                task.launchPath = "/usr/sbin/lsof"
-                task.arguments = ["-t", "-i", ":\(project.port)"]
-
-                let pipe = Pipe()
-                task.standardOutput = pipe
-
-                task.launch()
-                task.waitUntilExit()
-
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-                if !output.isEmpty {
-                    let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-                    for pid in pids {
-                        let killTask = Process()
-                        killTask.launchPath = "/bin/kill"
-                        killTask.arguments = ["-9", pid]
-                        killTask.launch()
-                        killTask.waitUntilExit()
-                    }
-                }
+                stopProjectByPort(project.port)
             }
         }
 
