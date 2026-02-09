@@ -315,13 +315,19 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     }
 
     func requestNotificationPermissions() {
+        // UserNotifications requires a proper app bundle; skip if running as bare executable
+        guard Bundle.main.bundleIdentifier != nil else {
+            notificationsAuthorized = false
+            return
+        }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             self?.notificationsAuthorized = granted
         }
     }
 
     func sendNotification(title: String, body: String) {
-        guard notificationsAuthorized, config?.notifications == true else { return }
+        guard notificationsAuthorized, config?.notifications == true,
+              Bundle.main.bundleIdentifier != nil else { return }
 
         let content = UNMutableNotificationContent()
         content.title = title
@@ -876,7 +882,8 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     @MainActor func stopProjectByPort(_ port: Int) {
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
-        task.arguments = ["-t", "-i", ":\(port)"]
+        // Only get LISTENING processes (servers), not client connections (browsers)
+        task.arguments = ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
 
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -890,42 +897,21 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         if !output.isEmpty {
             let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-            var pgids = Set<String>()
 
-            // Get process group IDs for all PIDs
             for pid in pids {
-                let pgidTask = Process()
-                pgidTask.launchPath = "/bin/ps"
-                pgidTask.arguments = ["-o", "pgid=", "-p", pid]
+                // First kill child processes of this PID
+                let pkillTask = Process()
+                pkillTask.launchPath = "/usr/bin/pkill"
+                pkillTask.arguments = ["-9", "-P", pid]
+                pkillTask.standardError = FileHandle.nullDevice
+                pkillTask.launch()
+                pkillTask.waitUntilExit()
 
-                let pgidPipe = Pipe()
-                pgidTask.standardOutput = pgidPipe
-                pgidTask.standardError = FileHandle.nullDevice
-
-                pgidTask.launch()
-                pgidTask.waitUntilExit()
-
-                let pgidData = pgidPipe.fileHandleForReading.readDataToEndOfFile()
-                if let pgid = String(data: pgidData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !pgid.isEmpty {
-                    pgids.insert(pgid)
-                }
-            }
-
-            // Kill entire process groups (negative PGID kills the whole group)
-            for pgid in pgids {
-                let killTask = Process()
-                killTask.launchPath = "/bin/kill"
-                killTask.arguments = ["-9", "-\(pgid)"]
-                killTask.launch()
-                killTask.waitUntilExit()
-            }
-
-            // Also kill individual PIDs as fallback (in case group kill had permission issues)
-            for pid in pids {
+                // Then kill the process itself
                 let killTask = Process()
                 killTask.launchPath = "/bin/kill"
                 killTask.arguments = ["-9", pid]
+                killTask.standardError = FileHandle.nullDevice
                 killTask.launch()
                 killTask.waitUntilExit()
             }
