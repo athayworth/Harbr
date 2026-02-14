@@ -39,6 +39,27 @@ struct Project: Codable {
     let port: Int
     let directory: String
     let startCommand: String
+    let group: String?
+    let healthCheckUrl: String?
+    let envVars: [String: String]?
+    let autoRestart: Bool?
+
+    /// Whether to auto-restart if the server crashes.
+    var shouldAutoRestart: Bool { autoRestart ?? false }
+
+    /// Creates a project with default optional values.
+    init(name: String, port: Int, directory: String, startCommand: String,
+         group: String? = nil, healthCheckUrl: String? = nil,
+         envVars: [String: String]? = nil, autoRestart: Bool? = nil) {
+        self.name = name
+        self.port = port
+        self.directory = directory
+        self.startCommand = startCommand
+        self.group = group
+        self.healthCheckUrl = healthCheckUrl
+        self.envVars = envVars
+        self.autoRestart = autoRestart
+    }
 }
 
 /// Application configuration containing all tracked projects.
@@ -46,6 +67,7 @@ struct Config: Codable {
     var projects: [Project]
     var terminalApp: TerminalApp?
     var notificationsEnabled: Bool?
+    var launchAtLoginEnabled: Bool?
 
     /// The terminal to use, defaulting to Terminal.app if not set.
     var terminal: TerminalApp {
@@ -58,6 +80,12 @@ struct Config: Codable {
         get { notificationsEnabled ?? true }
         set { notificationsEnabled = newValue }
     }
+
+    /// Whether to launch at login.
+    var launchAtLogin: Bool {
+        get { launchAtLoginEnabled ?? false }
+        set { launchAtLoginEnabled = newValue }
+    }
 }
 
 // MARK: - Project Editor Window
@@ -69,16 +97,21 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     var portField: NSTextField?
     var directoryField: NSTextField?
     var startCommandField: NSTextField?
-    var onSave: ((String, Int, String, String) -> Void)?
+    var groupField: NSTextField?
+    var healthCheckField: NSTextField?
+    var autoRestartCheckbox: NSButton?
+    var onSave: ((Project) -> Void)?
     var onCancel: (() -> Void)?
     private var didSave = false
+    private var existingEnvVars: [String: String]?
 
-    @MainActor init(project: Project? = nil, onSave: @escaping (String, Int, String, String) -> Void) {
+    @MainActor init(project: Project? = nil, onSave: @escaping (Project) -> Void) {
         super.init()
         self.onSave = onSave
+        self.existingEnvVars = project?.envVars
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 260),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 370),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -179,6 +212,54 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             contentView.addSubview(field)
         }
 
+        currentY -= rowHeight
+
+        // Group field
+        let groupLabel = NSTextField(labelWithString: "Group")
+        groupLabel.frame = NSRect(x: 20, y: currentY, width: labelWidth, height: 20)
+        groupLabel.alignment = .right
+        groupLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        contentView.addSubview(groupLabel)
+
+        groupField = NSTextField(frame: NSRect(x: fieldX, y: currentY - 2, width: fieldWidth, height: 24))
+        groupField?.stringValue = project?.group ?? ""
+        groupField?.placeholderString = "Optional group name"
+        groupField?.font = NSFont.systemFont(ofSize: 13)
+        groupField?.bezelStyle = .roundedBezel
+        if let field = groupField {
+            contentView.addSubview(field)
+        }
+
+        currentY -= rowHeight
+
+        // Health check URL field
+        let healthLabel = NSTextField(labelWithString: "Health Check")
+        healthLabel.frame = NSRect(x: 20, y: currentY, width: labelWidth, height: 20)
+        healthLabel.alignment = .right
+        healthLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        contentView.addSubview(healthLabel)
+
+        healthCheckField = NSTextField(frame: NSRect(x: fieldX, y: currentY - 2, width: fieldWidth, height: 24))
+        healthCheckField?.stringValue = project?.healthCheckUrl ?? ""
+        healthCheckField?.placeholderString = "/health or http://..."
+        healthCheckField?.font = NSFont.systemFont(ofSize: 13)
+        healthCheckField?.bezelStyle = .roundedBezel
+        if let field = healthCheckField {
+            contentView.addSubview(field)
+        }
+
+        currentY -= rowHeight
+
+        // Auto-restart checkbox
+        autoRestartCheckbox = NSButton(frame: NSRect(x: fieldX, y: currentY - 2, width: fieldWidth, height: 20))
+        autoRestartCheckbox?.setButtonType(.switch)
+        autoRestartCheckbox?.title = "Auto-restart if server crashes"
+        autoRestartCheckbox?.font = NSFont.systemFont(ofSize: 13)
+        autoRestartCheckbox?.state = (project?.autoRestart ?? false) ? .on : .off
+        if let checkbox = autoRestartCheckbox {
+            contentView.addSubview(checkbox)
+        }
+
         // Buttons
         let cancelButton = NSButton(frame: NSRect(x: 280, y: 16, width: 90, height: 32))
         cancelButton.title = "Cancel"
@@ -256,8 +337,24 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             return
         }
 
+        // Get optional field values
+        let group = groupField?.stringValue.isEmpty == false ? groupField?.stringValue : nil
+        let healthCheckUrl = healthCheckField?.stringValue.isEmpty == false ? healthCheckField?.stringValue : nil
+        let autoRestart = autoRestartCheckbox?.state == .on
+
+        let project = Project(
+            name: name,
+            port: port,
+            directory: expandedDirectory,
+            startCommand: startCommand,
+            group: group,
+            healthCheckUrl: healthCheckUrl,
+            envVars: existingEnvVars,
+            autoRestart: autoRestart
+        )
+
         didSave = true
-        onSave?(name, port, expandedDirectory, startCommand)
+        onSave?(project)
         window?.close()
     }
 
@@ -288,6 +385,8 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     var currentEditorWindow: ProjectEditorWindow?
     var previousPortStates: [Int: Bool] = [:]
     var notificationsAuthorized = false
+    /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
+    var userStoppedPorts: Set<Int> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -521,6 +620,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         let isActive: Bool
         let cpuUsage: Double?
         let memoryUsage: Double?
+        let healthStatus: Bool? // nil = no health check, true = healthy, false = unhealthy
     }
 
     /// Cache for port status to avoid blocking the menu on each open.
@@ -543,6 +643,44 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         let output = String(data: data, encoding: .utf8) ?? ""
 
         return !output.isEmpty && output.contains("LISTEN")
+    }
+
+    /// Checks if a project is healthy by pinging its health check URL.
+    /// Returns true if healthy, false if unhealthy, nil if no health check configured.
+    func checkProjectHealth(_ project: Project) -> Bool? {
+        guard let healthUrl = project.healthCheckUrl, !healthUrl.isEmpty else {
+            return nil // No health check configured
+        }
+
+        // Build full URL if relative path provided
+        let fullUrl: String
+        if healthUrl.hasPrefix("http://") || healthUrl.hasPrefix("https://") {
+            fullUrl = healthUrl
+        } else {
+            let path = healthUrl.hasPrefix("/") ? healthUrl : "/\(healthUrl)"
+            fullUrl = "http://localhost:\(project.port)\(path)"
+        }
+
+        guard let url = URL(string: fullUrl) else { return nil }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3.0
+        request.httpMethod = "GET"
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var isHealthy = false
+
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            if error == nil, let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode >= 200 && httpResponse.statusCode < 400 {
+                isHealthy = true
+            }
+            semaphore.signal()
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 4.0)
+
+        return isHealthy
     }
 
     func getResourceUsage(for port: Int) -> (cpu: Double, mem: Double)? {
@@ -605,8 +743,9 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     func updateResourceCache() {
         guard let config = config else { return }
 
-        // Capture previous states on main thread to avoid data race
+        // Capture states on main thread to avoid data race
         let capturedPreviousStates = self.previousPortStates
+        let capturedUserStoppedPorts = self.userStoppedPorts
         let projectsCopy = config.projects
 
         DispatchQueue.global(qos: .background).async { [weak self] in
@@ -617,13 +756,18 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                 let isActive = self?.isPortActive(project.port) ?? false
                 var cpu: Double? = nil
                 var mem: Double? = nil
+                var healthStatus: Bool? = nil
 
-                if isActive, let usage = self?.getResourceUsage(for: project.port) {
-                    cpu = usage.cpu
-                    mem = usage.mem
+                if isActive {
+                    if let usage = self?.getResourceUsage(for: project.port) {
+                        cpu = usage.cpu
+                        mem = usage.mem
+                    }
+                    // Check health endpoint if configured
+                    healthStatus = self?.checkProjectHealth(project)
                 }
 
-                newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem)
+                newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem, healthStatus: healthStatus)
 
                 // Check for state change using captured snapshot
                 if let previousState = capturedPreviousStates[project.port] {
@@ -641,23 +785,46 @@ class HarbrApp: NSObject, NSApplicationDelegate {
                     self.previousPortStates[project.port] = newCache[project.port]?.isActive ?? false
                 }
 
-                // Send notifications for state changes
+                // Collect projects that need auto-restart
+                var projectsToRestart: [Project] = []
+
+                // Send notifications and handle auto-restart for state changes
                 for change in stateChanges {
                     if change.started {
                         self.sendNotification(
                             title: "\(change.project.name) Started",
                             body: "Server is now running on port \(change.project.port)"
                         )
+                        // Clear user-stopped flag when server starts
+                        self.userStoppedPorts.remove(change.project.port)
                     } else {
                         self.sendNotification(
                             title: "\(change.project.name) Stopped",
                             body: "Server on port \(change.project.port) is no longer running"
                         )
+
+                        // Auto-restart if enabled and not user-stopped
+                        if change.project.shouldAutoRestart &&
+                           !capturedUserStoppedPorts.contains(change.project.port) {
+                            self.sendNotification(
+                                title: "Auto-restarting \(change.project.name)",
+                                body: "Server crashed, restarting automatically..."
+                            )
+                            projectsToRestart.append(change.project)
+                        }
                     }
                 }
 
                 self.portStatusCache = newCache
                 self.rebuildMenu()
+
+                // Schedule auto-restarts after a delay
+                if !projectsToRestart.isEmpty {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    for project in projectsToRestart {
+                        self.startProjectDirectly(project)
+                    }
+                }
             }
         }
     }
@@ -700,93 +867,37 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         menu.addItem(headerItem)
         menu.addItem(NSMenuItem.separator())
 
-        for project in config.projects {
-            let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil)
-            let title = "\(project.name)  :\(project.port)"
+        // Group projects by their group field
+        let ungroupedProjects = config.projects.filter { $0.group == nil || $0.group?.isEmpty == true }
+        let groupedProjects = config.projects.filter { $0.group != nil && $0.group?.isEmpty == false }
+        let groups = Dictionary(grouping: groupedProjects) { $0.group ?? "" }
+        let sortedGroupNames = groups.keys.sorted()
 
-            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        // Add ungrouped projects first
+        for project in ungroupedProjects {
+            addProjectMenuItem(project, to: menu)
+        }
 
-            // Use SF Symbols for status
-            if let statusImage = NSImage(systemSymbolName: status.isActive ? "circle.fill" : "circle", accessibilityDescription: status.isActive ? "Running" : "Stopped") {
-                let symbolConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
-                let tintedImage = statusImage.withSymbolConfiguration(symbolConfig)
-                item.image = tintedImage
-                if status.isActive {
-                    item.image?.isTemplate = false
-                    // Create a green-tinted version
-                    let greenImage = NSImage(size: statusImage.size, flipped: false) { rect in
-                        NSColor.systemGreen.set()
-                        statusImage.draw(in: rect)
-                        return true
-                    }
-                    item.image = greenImage
-                }
-            }
-            let submenu = NSMenu()
-
-            if status.isActive {
-                // Show resource usage at top of submenu
-                if let cpu = status.cpuUsage, let mem = status.memoryUsage {
-                    let statsItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                    let cpuStr = String(format: "%.1f%%", cpu)
-                    let memStr = String(format: "%.1f%%", mem)
-                    statsItem.attributedTitle = NSAttributedString(
-                        string: "CPU \(cpuStr)   MEM \(memStr)",
-                        attributes: [
-                            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
-                            .foregroundColor: NSColor.secondaryLabelColor
-                        ]
-                    )
-                    statsItem.isEnabled = false
-                    submenu.addItem(statsItem)
-                    submenu.addItem(NSMenuItem.separator())
-                }
-
-                let stopItem = NSMenuItem(title: "Stop", action: #selector(stopProject(_:)), keyEquivalent: "")
-                stopItem.representedObject = project
-                stopItem.target = self
-                submenu.addItem(stopItem)
-
-                let restartItem = NSMenuItem(title: "Restart", action: #selector(restartProject(_:)), keyEquivalent: "")
-                restartItem.representedObject = project
-                restartItem.target = self
-                submenu.addItem(restartItem)
-            } else {
-                let startItem = NSMenuItem(title: "Start", action: #selector(startProject(_:)), keyEquivalent: "")
-                startItem.representedObject = project
-                startItem.target = self
-                submenu.addItem(startItem)
+        // Add grouped projects with headers
+        for groupName in sortedGroupNames {
+            if !ungroupedProjects.isEmpty || groupName != sortedGroupNames.first {
+                menu.addItem(NSMenuItem.separator())
             }
 
-            let openDirItem = NSMenuItem(title: "Open in Finder", action: #selector(openDirectory(_:)), keyEquivalent: "")
-            openDirItem.representedObject = project
-            openDirItem.target = self
-            submenu.addItem(openDirItem)
+            let groupHeader = NSMenuItem(title: groupName, action: nil, keyEquivalent: "")
+            groupHeader.attributedTitle = NSAttributedString(
+                string: groupName,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+            groupHeader.isEnabled = false
+            menu.addItem(groupHeader)
 
-            let openTerminalItem = NSMenuItem(title: "Open in Terminal", action: #selector(openInTerminal(_:)), keyEquivalent: "")
-            openTerminalItem.representedObject = project
-            openTerminalItem.target = self
-            submenu.addItem(openTerminalItem)
-
-            let openBrowserItem = NSMenuItem(title: "Open in Browser", action: #selector(openInBrowser(_:)), keyEquivalent: "")
-            openBrowserItem.representedObject = project
-            openBrowserItem.target = self
-            submenu.addItem(openBrowserItem)
-
-            submenu.addItem(NSMenuItem.separator())
-
-            let editItem = NSMenuItem(title: "Edit...", action: #selector(editProject(_:)), keyEquivalent: "")
-            editItem.representedObject = project
-            editItem.target = self
-            submenu.addItem(editItem)
-
-            let deleteItem = NSMenuItem(title: "Delete...", action: #selector(deleteProject(_:)), keyEquivalent: "")
-            deleteItem.representedObject = project
-            deleteItem.target = self
-            submenu.addItem(deleteItem)
-
-            item.submenu = submenu
-            menu.addItem(item)
+            for project in groups[groupName] ?? [] {
+                addProjectMenuItem(project, to: menu)
+            }
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -849,6 +960,11 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         notificationsItem.state = config.notifications ? .on : .off
         prefsSubmenu.addItem(notificationsItem)
 
+        let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        launchAtLoginItem.target = self
+        launchAtLoginItem.state = config.launchAtLogin ? .on : .off
+        prefsSubmenu.addItem(launchAtLoginItem)
+
         prefsItem.submenu = prefsSubmenu
         menu.addItem(prefsItem)
 
@@ -861,12 +977,160 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         statusItem?.menu = menu
     }
 
+    @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
+        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil)
+        let title = "\(project.name)  :\(project.port)"
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+
+        // Use SF Symbols for status
+        // Green = running & healthy, Yellow = running but unhealthy, Gray = stopped
+        let statusColor: NSColor
+        let statusSymbol: String
+        let statusDescription: String
+
+        if status.isActive {
+            if status.healthStatus == false {
+                // Running but health check failed
+                statusColor = .systemYellow
+                statusSymbol = "exclamationmark.circle.fill"
+                statusDescription = "Unhealthy"
+            } else {
+                // Running and healthy (or no health check)
+                statusColor = .systemGreen
+                statusSymbol = "circle.fill"
+                statusDescription = "Running"
+            }
+        } else {
+            statusColor = .secondaryLabelColor
+            statusSymbol = "circle"
+            statusDescription = "Stopped"
+        }
+
+        if let statusImage = NSImage(systemSymbolName: statusSymbol, accessibilityDescription: statusDescription) {
+            let symbolConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+            let configuredImage = statusImage.withSymbolConfiguration(symbolConfig)
+            item.image?.isTemplate = false
+            let tintedImage = NSImage(size: configuredImage?.size ?? statusImage.size, flipped: false) { rect in
+                statusColor.set()
+                (configuredImage ?? statusImage).draw(in: rect)
+                return true
+            }
+            item.image = tintedImage
+        }
+        let submenu = NSMenu()
+
+        if status.isActive {
+            // Show resource usage and health at top of submenu
+            if let cpu = status.cpuUsage, let mem = status.memoryUsage {
+                let statsItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                let cpuStr = String(format: "%.1f%%", cpu)
+                let memStr = String(format: "%.1f%%", mem)
+                var statsText = "CPU \(cpuStr)   MEM \(memStr)"
+
+                // Add health status if configured
+                if let healthy = status.healthStatus {
+                    statsText += healthy ? "   ✓ Healthy" : "   ⚠ Unhealthy"
+                }
+
+                statsItem.attributedTitle = NSAttributedString(
+                    string: statsText,
+                    attributes: [
+                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                        .foregroundColor: NSColor.secondaryLabelColor
+                    ]
+                )
+                statsItem.isEnabled = false
+                submenu.addItem(statsItem)
+                submenu.addItem(NSMenuItem.separator())
+            }
+
+            let stopItem = NSMenuItem(title: "Stop", action: #selector(stopProject(_:)), keyEquivalent: "")
+            stopItem.representedObject = project
+            stopItem.target = self
+            submenu.addItem(stopItem)
+
+            let restartItem = NSMenuItem(title: "Restart", action: #selector(restartProject(_:)), keyEquivalent: "")
+            restartItem.representedObject = project
+            restartItem.target = self
+            submenu.addItem(restartItem)
+        } else {
+            let startItem = NSMenuItem(title: "Start", action: #selector(startProject(_:)), keyEquivalent: "")
+            startItem.representedObject = project
+            startItem.target = self
+            submenu.addItem(startItem)
+        }
+
+        let openDirItem = NSMenuItem(title: "Open in Finder", action: #selector(openDirectory(_:)), keyEquivalent: "")
+        openDirItem.representedObject = project
+        openDirItem.target = self
+        submenu.addItem(openDirItem)
+
+        let openTerminalItem = NSMenuItem(title: "Open in Terminal", action: #selector(openInTerminal(_:)), keyEquivalent: "")
+        openTerminalItem.representedObject = project
+        openTerminalItem.target = self
+        submenu.addItem(openTerminalItem)
+
+        let openBrowserItem = NSMenuItem(title: "Open in Browser", action: #selector(openInBrowser(_:)), keyEquivalent: "")
+        openBrowserItem.representedObject = project
+        openBrowserItem.target = self
+        submenu.addItem(openBrowserItem)
+
+        let copyUrlItem = NSMenuItem(title: "Copy URL", action: #selector(copyProjectUrl(_:)), keyEquivalent: "")
+        copyUrlItem.representedObject = project
+        copyUrlItem.target = self
+        submenu.addItem(copyUrlItem)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let editItem = NSMenuItem(title: "Edit...", action: #selector(editProject(_:)), keyEquivalent: "")
+        editItem.representedObject = project
+        editItem.target = self
+        submenu.addItem(editItem)
+
+        let deleteItem = NSMenuItem(title: "Delete...", action: #selector(deleteProject(_:)), keyEquivalent: "")
+        deleteItem.representedObject = project
+        deleteItem.target = self
+        submenu.addItem(deleteItem)
+
+        item.submenu = submenu
+        menu.addItem(item)
+    }
+
     // MARK: Project Actions
 
     @MainActor @objc func startProject(_ sender: NSMenuItem) {
         guard let project = sender.representedObject as? Project else { return }
 
-        openTerminal(directory: project.directory, command: project.startCommand)
+        // Check for port conflict
+        if isPortActive(project.port) {
+            let alert = NSAlert()
+            alert.messageText = "Port Already in Use"
+            alert.informativeText = "Port \(project.port) is already in use by another process. Start anyway?"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Start Anyway")
+            alert.addButton(withTitle: "Cancel")
+
+            if alert.runModal() != .alertFirstButtonReturn {
+                return
+            }
+        }
+
+        startProjectDirectly(project)
+    }
+
+    @MainActor func startProjectDirectly(_ project: Project) {
+        // Clear user-stopped flag since we're starting it
+        userStoppedPorts.remove(project.port)
+
+        // Build command with environment variables if present
+        var command = project.startCommand
+        if let envVars = project.envVars, !envVars.isEmpty {
+            let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
+            command = "\(envPrefix) \(command)"
+        }
+
+        openTerminal(directory: project.directory, command: command)
 
         // Wait a moment then refresh
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -879,7 +1143,11 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         stopProjectByPort(project.port)
     }
 
-    @MainActor func stopProjectByPort(_ port: Int) {
+    @MainActor func stopProjectByPort(_ port: Int, userInitiated: Bool = true) {
+        if userInitiated {
+            userStoppedPorts.insert(port)
+        }
+
         let task = Process()
         task.launchPath = "/usr/sbin/lsof"
         // Only get LISTENING processes (servers), not client connections (browsers)
@@ -925,18 +1193,16 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
     @MainActor @objc func restartProject(_ sender: NSMenuItem) {
         guard let project = sender.representedObject as? Project else { return }
+        restartProjectDirectly(project)
+    }
 
+    @MainActor func restartProjectDirectly(_ project: Project) {
         // Stop first
         stopProjectByPort(project.port)
 
         // Wait for processes to fully terminate, then start
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.openTerminal(directory: project.directory, command: project.startCommand)
-
-            // Refresh menu after another moment
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                self?.updateMenu()
-            }
+            self?.startProjectDirectly(project)
         }
     }
 
@@ -946,7 +1212,13 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         for project in config.projects {
             let status = portStatusCache[project.port]
             if status?.isActive != true {
-                openTerminal(directory: project.directory, command: project.startCommand, activate: false)
+                // Build command with environment variables if present
+                var command = project.startCommand
+                if let envVars = project.envVars, !envVars.isEmpty {
+                    let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
+                    command = "\(envPrefix) \(command)"
+                }
+                openTerminal(directory: project.directory, command: command, activate: false)
             }
         }
 
@@ -989,6 +1261,13 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    @MainActor @objc func copyProjectUrl(_ sender: NSMenuItem) {
+        guard let project = sender.representedObject as? Project else { return }
+        let url = "http://localhost:\(project.port)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+    }
+
     @MainActor @objc func setTerminalApp(_ sender: NSMenuItem) {
         guard let terminal = sender.representedObject as? TerminalApp else { return }
         config?.terminal = terminal
@@ -998,6 +1277,84 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     @MainActor @objc func toggleNotifications() {
         config?.notifications = !(config?.notifications ?? true)
         saveConfig()
+    }
+
+    @MainActor @objc func toggleLaunchAtLogin() {
+        let newValue = !(config?.launchAtLogin ?? false)
+        config?.launchAtLogin = newValue
+
+        if newValue {
+            installLaunchAgent()
+        } else {
+            uninstallLaunchAgent()
+        }
+
+        saveConfig()
+    }
+
+    private func launchAgentPath() -> String {
+        return NSString(string: "~/Library/LaunchAgents/com.alexanderhayworth.harbr.plist").expandingTildeInPath
+    }
+
+    private func installLaunchAgent() {
+        let appPath = Bundle.main.bundlePath.isEmpty
+            ? ProcessInfo.processInfo.arguments[0]
+            : "\(Bundle.main.bundlePath)/Contents/MacOS/Harbr"
+
+        let plistContent = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>com.alexanderhayworth.harbr</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>\(appPath)</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <false/>
+        </dict>
+        </plist>
+        """
+
+        let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
+        let fileManager = FileManager.default
+
+        // Create LaunchAgents directory if needed
+        if !fileManager.fileExists(atPath: launchAgentsDir) {
+            try? fileManager.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+        }
+
+        // Write the plist
+        try? plistContent.write(toFile: launchAgentPath(), atomically: true, encoding: .utf8)
+
+        // Load the agent
+        let task = Process()
+        task.launchPath = "/bin/launchctl"
+        task.arguments = ["load", launchAgentPath()]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
+    }
+
+    private func uninstallLaunchAgent() {
+        let path = launchAgentPath()
+
+        // Unload the agent
+        let task = Process()
+        task.launchPath = "/bin/launchctl"
+        task.arguments = ["unload", path]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        task.waitUntilExit()
+
+        // Remove the plist
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     @MainActor @objc func reloadConfig() {
@@ -1019,9 +1376,8 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     }
 
     @MainActor @objc func addNewProject() {
-        currentEditorWindow = ProjectEditorWindow { [weak self] name, port, directory, startCommand in
-            let newProject = Project(name: name, port: port, directory: directory, startCommand: startCommand)
-            self?.config?.projects.append(newProject)
+        currentEditorWindow = ProjectEditorWindow { [weak self] project in
+            self?.config?.projects.append(project)
             self?.saveConfig()
             self?.currentEditorWindow = nil
         }
@@ -1038,12 +1394,11 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         let originalPort = project.port
 
-        currentEditorWindow = ProjectEditorWindow(project: project) { [weak self] name, port, directory, startCommand in
+        currentEditorWindow = ProjectEditorWindow(project: project) { [weak self] updatedProject in
             guard let self = self,
                   let index = self.config?.projects.firstIndex(where: { $0.port == originalPort }) else {
                 return
             }
-            let updatedProject = Project(name: name, port: port, directory: directory, startCommand: startCommand)
             self.config?.projects[index] = updatedProject
             self.saveConfig()
             self.currentEditorWindow = nil
