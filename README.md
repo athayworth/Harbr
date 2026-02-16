@@ -9,31 +9,34 @@ A lightweight macOS menu bar app that monitors your localhost development server
 ## Features
 
 - **Live status monitoring** of localhost ports with visual indicators
-- **Start servers** directly from the menu bar (opens Terminal with your command)
-- **Stop running servers** with one click
+- **Start/Stop/Restart servers** directly from the menu bar
 - **Start/Stop All** - bulk actions for all projects
+- **Auto-restart on crash** - automatically restart servers that go down
+- **Health check endpoints** - verify servers are responding, not just listening
 - **Resource monitoring** - see CPU and memory usage for each server
+- **Project groups** - organize projects into groups with section headers
 - **Quick access** - open project directories in Finder, Terminal, or Browser
+- **Copy URL** - quickly copy localhost URL to clipboard
+- **Port conflict warnings** - alert before starting if port is in use
+- **Environment variables** - set env vars per project
 - **Project management** - add, edit, and delete projects via UI
 - **Multiple terminal support** - Terminal.app, iTerm2, or Warp
+- **Launch at Login** - built-in toggle to start automatically
 - **Notifications** - get notified when servers start or stop
 - **Running count** - see how many servers are active in the menu bar
 - **Auto-refresh** every 5 seconds
 
 ## Installation
 
-### Build as Application (Recommended)
+### Quick Install (Recommended)
 
 ```bash
-git clone https://github.com/yourusername/Harbr.git
+git clone https://github.com/athayworth/Harbr.git
 cd Harbr
-./scripts/build-app.sh
+./scripts/install.sh
 ```
 
-Then copy to Applications:
-```bash
-cp -r build/Harbr.app /Applications/
-```
+This builds and installs Harbr to `/Applications/Harbr.app`.
 
 ### Build from Source (CLI)
 
@@ -58,28 +61,41 @@ Harbr stores project configurations in `~/.harbr/config.json`. You can either:
       "name": "My Next.js App",
       "port": 3000,
       "directory": "/Users/yourusername/Projects/my-nextjs-app",
-      "startCommand": "npm run dev"
+      "startCommand": "npm run dev",
+      "group": "Frontend",
+      "healthCheckUrl": "/api/health",
+      "autoRestart": true
     },
     {
       "name": "API Server",
       "port": 8080,
       "directory": "/Users/yourusername/Projects/api-server",
-      "startCommand": "go run main.go"
+      "startCommand": "go run main.go",
+      "group": "Backend",
+      "envVars": {
+        "GO_ENV": "development",
+        "DEBUG": "true"
+      }
     }
   ],
   "terminalApp": "Terminal",
-  "notificationsEnabled": true
+  "notificationsEnabled": true,
+  "launchAtLoginEnabled": false
 }
 ```
 
 ### Project Fields
 
-| Field | Description | Example |
-|-------|-------------|---------|
-| `name` | Display name for the project | `"My App"` |
-| `port` | Localhost port to monitor (1-65535) | `3000` |
-| `directory` | Full path to project directory | `"/Users/me/Projects/app"` |
-| `startCommand` | Command to start the dev server | `"npm run dev"` |
+| Field | Description | Required | Example |
+|-------|-------------|----------|---------|
+| `name` | Display name for the project | Yes | `"My App"` |
+| `port` | Localhost port to monitor (1-65535) | Yes | `3000` |
+| `directory` | Full path to project directory | Yes | `"/Users/me/Projects/app"` |
+| `startCommand` | Command to start the dev server | Yes | `"npm run dev"` |
+| `group` | Group name for organizing projects | No | `"Frontend"` |
+| `healthCheckUrl` | URL path or full URL to check server health | No | `"/health"` |
+| `envVars` | Environment variables to set when starting | No | `{"NODE_ENV": "dev"}` |
+| `autoRestart` | Auto-restart if server crashes | No | `true` |
 
 ### Settings
 
@@ -87,32 +103,32 @@ Harbr stores project configurations in `~/.harbr/config.json`. You can either:
 |---------|-------------|--------|
 | `terminalApp` | Terminal to use for commands | `"Terminal"`, `"iTerm"`, `"Warp"` |
 | `notificationsEnabled` | Show notifications on state changes | `true` / `false` |
+| `launchAtLoginEnabled` | Start Harbr when you log in | `true` / `false` |
 
 ## Usage
 
 1. **Click the menu bar icon** (sailboat) to see all configured projects
-2. **Green dot** = server is running (shows CPU/memory usage)
-3. **Empty circle** = server is stopped
-4. **Number badge** = count of running servers
-5. **Click a project** to see available actions:
-   - Start/Stop the server
+2. **Status indicators**:
+   - **Green dot** = server is running and healthy
+   - **Yellow warning** = server is running but health check failed
+   - **Empty circle** = server is stopped
+   - **Number badge** = count of running servers
+3. **Click a project** to see available actions:
+   - Start/Stop/Restart the server
    - Open in Finder
    - Open in Terminal
    - Open in Browser (localhost:port)
+   - Copy URL to clipboard
    - Edit or Delete the project
-6. **Bulk actions**: Start All / Stop All
-7. **Preferences**: Choose terminal app, toggle notifications
-8. **Keyboard shortcuts**:
+4. **Bulk actions**: Start All / Stop All
+5. **Preferences**:
+   - Choose terminal app
+   - Toggle notifications
+   - Toggle Launch at Login
+6. **Keyboard shortcuts**:
    - `⌘N` - Add new project
    - `⌘R` - Reload configuration
    - `⌘Q` - Quit
-
-## Launch at Login
-
-1. Build the app: `./scripts/build-app.sh`
-2. Copy to Applications: `cp -r build/Harbr.app /Applications/`
-3. Open System Settings → General → Login Items
-4. Click '+' and select Harbr from Applications
 
 ## Requirements
 
@@ -124,9 +140,11 @@ Harbr stores project configurations in `~/.harbr/config.json`. You can either:
 Harbr uses system tools to monitor and manage your development servers:
 
 - **Port detection**: Uses `lsof` to check which ports have active listeners
+- **Health checks**: Uses URLSession to ping health endpoints
 - **Resource monitoring**: Uses `ps` to get CPU and memory usage
 - **Server management**: Uses AppleScript to open Terminal/iTerm/Warp and run commands
-- **Process control**: Uses `kill` to stop servers
+- **Process control**: Uses `kill` and `pkill` to stop servers and child processes
+- **Launch at Login**: Creates a LaunchAgent in `~/Library/LaunchAgents/`
 - **Notifications**: Uses UserNotifications framework for system notifications
 
 ## License
