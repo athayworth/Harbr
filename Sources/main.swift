@@ -378,7 +378,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
 // MARK: - Main Application
 
 /// The main application delegate that manages the menu bar interface and server monitoring.
-class HarbrApp: NSObject, NSApplicationDelegate {
+class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem?
     var config: Config?
     var timer: Timer?
@@ -387,6 +387,12 @@ class HarbrApp: NSObject, NSApplicationDelegate {
     var notificationsAuthorized = false
     /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
     var userStoppedPorts: Set<Int> = []
+    /// The persistent menu object - reused to avoid crashes from releasing during animations
+    var statusMenu: NSMenu?
+    /// Tracks whether the menu is currently open
+    var isMenuOpen = false
+    /// Tracks whether a menu rebuild is pending (deferred while menu is open)
+    var pendingMenuRebuild = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -400,6 +406,11 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         // Request notification permissions
         requestNotificationPermissions()
+
+        // Create persistent menu with delegate to track open/close state
+        statusMenu = NSMenu()
+        statusMenu?.delegate = self
+        statusItem?.menu = statusMenu
 
         // Build initial menu immediately (without resource info)
         rebuildMenu()
@@ -834,8 +845,34 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         updateResourceCache()
     }
 
+    // MARK: - NSMenuDelegate
+
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+        // If a rebuild was requested while menu was open, do it now
+        if pendingMenuRebuild {
+            pendingMenuRebuild = false
+            DispatchQueue.main.async { [weak self] in
+                self?.rebuildMenu()
+            }
+        }
+    }
+
     @MainActor func rebuildMenu() {
-        let menu = NSMenu()
+        // Defer rebuild if menu is currently open to avoid animation crashes
+        if isMenuOpen {
+            pendingMenuRebuild = true
+            return
+        }
+
+        guard let menu = statusMenu else { return }
+
+        // Clear existing items and rebuild (reusing the same menu object)
+        menu.removeAllItems()
 
         // Update menu bar icon with running count
         let runningCount = portStatusCache.values.filter { $0.isActive }.count
@@ -849,10 +886,13 @@ class HarbrApp: NSObject, NSApplicationDelegate {
 
         guard let config = config else {
             menu.addItem(NSMenuItem(title: "No projects configured", action: nil, keyEquivalent: ""))
-            menu.addItem(NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n"))
+            let addItem = NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n")
+            addItem.target = self
+            menu.addItem(addItem)
             menu.addItem(NSMenuItem.separator())
-            menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
-            statusItem?.menu = menu
+            let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+            quitItem.target = self
+            menu.addItem(quitItem)
             return
         }
 
@@ -973,8 +1013,7 @@ class HarbrApp: NSObject, NSApplicationDelegate {
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-
-        statusItem?.menu = menu
+        // Menu is already assigned to statusItem, no need to reassign
     }
 
     @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
