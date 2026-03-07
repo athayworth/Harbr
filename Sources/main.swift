@@ -102,6 +102,8 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     var autoRestartCheckbox: NSButton?
     var onSave: ((Project) -> Void)?
     var onCancel: (() -> Void)?
+    /// Called after the window closes, regardless of save or cancel. Use for cleanup.
+    var onDismiss: (() -> Void)?
     private var didSave = false
     private var existingEnvVars: [String: String]?
 
@@ -367,6 +369,8 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         if !didSave {
             onCancel?()
         }
+        // Always call onDismiss for cleanup after window fully closes
+        onDismiss?()
     }
 
     @MainActor func show() {
@@ -1418,9 +1422,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentEditorWindow = ProjectEditorWindow { [weak self] project in
             self?.config?.projects.append(project)
             self?.saveConfig()
-            self?.currentEditorWindow = nil
         }
-        currentEditorWindow?.onCancel = { [weak self] in
+        currentEditorWindow?.onDismiss = { [weak self] in
             self?.currentEditorWindow = nil
         }
         currentEditorWindow?.show()
@@ -1440,9 +1443,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             self.config?.projects[index] = updatedProject
             self.saveConfig()
-            self.currentEditorWindow = nil
         }
-        currentEditorWindow?.onCancel = { [weak self] in
+        currentEditorWindow?.onDismiss = { [weak self] in
             self?.currentEditorWindow = nil
         }
         currentEditorWindow?.show()
