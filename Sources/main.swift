@@ -92,7 +92,7 @@ struct Config: Codable {
 
 /// A modal window for adding or editing project configurations.
 class ProjectEditorWindow: NSObject, NSWindowDelegate {
-    var window: NSWindow?
+    private var window: NSWindow?
     var nameField: NSTextField?
     var portField: NSTextField?
     var directoryField: NSTextField?
@@ -101,10 +101,9 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     var healthCheckField: NSTextField?
     var autoRestartCheckbox: NSButton?
     var onSave: ((Project) -> Void)?
-    var onCancel: (() -> Void)?
-    /// Called after the window closes, regardless of save or cancel. Use for cleanup.
+    /// Called when the editor is dismissed (save, cancel, or window close button).
     var onDismiss: (() -> Void)?
-    private var didSave = false
+    private var didDismiss = false
     private var existingEnvVars: [String: String]?
 
     @MainActor init(project: Project? = nil, onSave: @escaping (Project) -> Void) {
@@ -355,22 +354,26 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             autoRestart: autoRestart
         )
 
-        didSave = true
         onSave?(project)
-        window?.close()
+        dismiss()
     }
 
     @MainActor @objc func cancel() {
-        onCancel?()
-        window?.close()
+        dismiss()
+    }
+
+    /// Hides the window and triggers cleanup. Does not deallocate immediately.
+    @MainActor private func dismiss() {
+        guard !didDismiss else { return }
+        didDismiss = true
+        window?.delegate = nil
+        window?.orderOut(nil)  // Hide immediately without animation
+        onDismiss?()
     }
 
     @MainActor func windowWillClose(_ notification: Notification) {
-        if !didSave {
-            onCancel?()
-        }
-        // Always call onDismiss for cleanup after window fully closes
-        onDismiss?()
+        // Handle case where user clicks the window's close button (X)
+        dismiss()
     }
 
     @MainActor func show() {
