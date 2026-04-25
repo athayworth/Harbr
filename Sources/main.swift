@@ -121,6 +121,9 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         window.center()
         window.delegate = self
         window.isMovableByWindowBackground = true
+        // ARC owns the window's lifetime; without this, AppKit also releases on close,
+        // causing a double-free with pending CoreAnimation transform animations.
+        window.isReleasedWhenClosed = false
         self.window = window
 
         guard let windowContentView = window.contentView else {
@@ -1427,7 +1430,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.saveConfig()
         }
         currentEditorWindow?.onDismiss = { [weak self] in
-            self?.currentEditorWindow = nil
+            // Defer release so pending CoreAnimation transactions can flush before
+            // the NSWindow deallocates (otherwise CA tries to release a freed
+            // _NSWindowTransformAnimation on the next runloop tick → SIGBUS).
+            DispatchQueue.main.async {
+                self?.currentEditorWindow = nil
+            }
         }
         currentEditorWindow?.show()
     }
@@ -1448,7 +1456,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.saveConfig()
         }
         currentEditorWindow?.onDismiss = { [weak self] in
-            self?.currentEditorWindow = nil
+            DispatchQueue.main.async {
+                self?.currentEditorWindow = nil
+            }
         }
         currentEditorWindow?.show()
     }
