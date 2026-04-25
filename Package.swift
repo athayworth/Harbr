@@ -8,6 +8,9 @@ let package = Package(
         .macOS(.v12)
     ],
     targets: [
-        .executableTarget(name: "Harbr")
+        .executableTarget(
+            name: "Harbr",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        )
     ]
 )
