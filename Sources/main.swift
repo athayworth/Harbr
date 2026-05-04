@@ -405,6 +405,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Hard cap on consecutive auto-restart attempts before Harbr gives up and
     /// surfaces a notification asking the user to investigate.
     static let MAX_RESTART_ATTEMPTS = 3
+    /// Wall-clock time of the most recent Harbr-initiated spawn, per port.
+    /// Used to gate auto-restart to the supervised window: ports that have
+    /// been up past the window are treated as stable, so a subsequent
+    /// port-down is presumed intentional (e.g. `docker compose down` from
+    /// another terminal) rather than a crash to recover from.
+    var lastSpawnAt: [Int: Date] = [:]
+    /// Duration after spawn during which auto-restart fires on port-down.
+    /// Long enough to cover slow boots (Docker daemon warmup, supabase
+    /// init), short enough that a server running for an hour and then
+    /// being shut down externally won't get respawned.
+    static let SUPERVISED_WINDOW: TimeInterval = 30
     /// The persistent menu object - reused to avoid crashes from releasing during animations
     var statusMenu: NSMenu?
     /// Tracks whether the menu is currently open
@@ -836,11 +847,22 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             body: "Server on port \(change.project.port) is no longer running"
                         )
 
-                        // Auto-restart if enabled and not user-stopped, capped at
-                        // MAX_RESTART_ATTEMPTS to prevent infinite cascades when the
-                        // process can't bind (EADDRINUSE, port permission, etc.).
+                        // Auto-restart fires only inside the supervised window
+                        // after a Harbr-initiated spawn. Outside the window the
+                        // project is considered stable, and a port-down event is
+                        // treated as intentional (e.g. `docker compose down`)
+                        // rather than a crash. Inside the window, the existing
+                        // retry cap still applies to prevent EADDRINUSE cascades.
+                        let withinSupervisedWindow: Bool = {
+                            guard let spawn = self.lastSpawnAt[change.project.port] else {
+                                return false
+                            }
+                            return Date().timeIntervalSince(spawn) <= HarbrApp.SUPERVISED_WINDOW
+                        }()
+
                         if change.project.shouldAutoRestart &&
-                           !capturedUserStoppedPorts.contains(change.project.port) {
+                           !capturedUserStoppedPorts.contains(change.project.port) &&
+                           withinSupervisedWindow {
                             let attempts = self.restartAttempts[change.project.port, default: 0]
                             if attempts >= HarbrApp.MAX_RESTART_ATTEMPTS {
                                 self.sendNotification(
@@ -1215,15 +1237,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Build the env-prefixed command and hand off to openTerminal. Split out
     /// of startProjectDirectly so the port-conflict path can defer the spawn
-    /// without duplicating the command-building logic.
-    @MainActor private func openProjectTerminal(_ project: Project) {
+    /// without duplicating the command-building logic. Recording lastSpawnAt
+    /// here is the single chokepoint that opens the supervised window.
+    @MainActor private func openProjectTerminal(_ project: Project, activate: Bool = true) {
         var command = project.startCommand
         if let envVars = project.envVars, !envVars.isEmpty {
             let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
             command = "\(envPrefix) \(command)"
         }
 
-        openTerminal(directory: project.directory, command: command)
+        lastSpawnAt[project.port] = Date()
+        openTerminal(directory: project.directory, command: command, activate: activate)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.updateMenu()
@@ -1304,13 +1328,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for project in config.projects {
             let status = portStatusCache[project.port]
             if status?.isActive != true {
-                // Build command with environment variables if present
-                var command = project.startCommand
-                if let envVars = project.envVars, !envVars.isEmpty {
-                    let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
-                    command = "\(envPrefix) \(command)"
-                }
-                openTerminal(directory: project.directory, command: command, activate: false)
+                // Route through openProjectTerminal so each project gets its
+                // supervised window opened (and env-var handling stays in one
+                // place). activate:false because we activate once below.
+                openProjectTerminal(project, activate: false)
             }
         }
 
