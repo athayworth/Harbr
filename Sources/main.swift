@@ -397,6 +397,14 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var notificationsAuthorized = false
     /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
     var userStoppedPorts: Set<Int> = []
+    /// Per-port consecutive failed-restart count. Reset to 0 when the port comes
+    /// up successfully. Used to cap the retry loop at MAX_RESTART_ATTEMPTS so a
+    /// process that won't bind (e.g. EADDRINUSE because the prior PID hasn't
+    /// released the port) doesn't generate an infinite cascade of Terminal windows.
+    var restartAttempts: [Int: Int] = [:]
+    /// Hard cap on consecutive auto-restart attempts before Harbr gives up and
+    /// surfaces a notification asking the user to investigate.
+    static let MAX_RESTART_ATTEMPTS = 3
     /// The persistent menu object - reused to avoid crashes from releasing during animations
     var statusMenu: NSMenu?
     /// Tracks whether the menu is currently open
@@ -816,22 +824,38 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             title: "\(change.project.name) Started",
                             body: "Server is now running on port \(change.project.port)"
                         )
-                        // Clear user-stopped flag when server starts
+                        // Clear user-stopped flag and reset attempt counter when the server
+                        // successfully comes up. Reset is critical — without it, a project
+                        // that crashes after a few healthy hours would still have stale
+                        // attempt count, possibly above the cap, and never restart.
                         self.userStoppedPorts.remove(change.project.port)
+                        self.restartAttempts[change.project.port] = 0
                     } else {
                         self.sendNotification(
                             title: "\(change.project.name) Stopped",
                             body: "Server on port \(change.project.port) is no longer running"
                         )
 
-                        // Auto-restart if enabled and not user-stopped
+                        // Auto-restart if enabled and not user-stopped, capped at
+                        // MAX_RESTART_ATTEMPTS to prevent infinite cascades when the
+                        // process can't bind (EADDRINUSE, port permission, etc.).
                         if change.project.shouldAutoRestart &&
                            !capturedUserStoppedPorts.contains(change.project.port) {
-                            self.sendNotification(
-                                title: "Auto-restarting \(change.project.name)",
-                                body: "Server crashed, restarting automatically..."
-                            )
-                            projectsToRestart.append(change.project)
+                            let attempts = self.restartAttempts[change.project.port, default: 0]
+                            if attempts >= HarbrApp.MAX_RESTART_ATTEMPTS {
+                                self.sendNotification(
+                                    title: "\(change.project.name) — auto-restart suspended",
+                                    body: "Failed \(attempts) times in a row. Click the menu bar icon to investigate."
+                                )
+                                // Don't enqueue another retry. User must manually start.
+                            } else {
+                                self.restartAttempts[change.project.port] = attempts + 1
+                                self.sendNotification(
+                                    title: "Auto-restarting \(change.project.name)",
+                                    body: "Server stopped, restarting (attempt \(attempts + 1)/\(HarbrApp.MAX_RESTART_ATTEMPTS))…"
+                                )
+                                projectsToRestart.append(change.project)
+                            }
                         }
                     }
                 }
@@ -1172,7 +1196,27 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Clear user-stopped flag since we're starting it
         userStoppedPorts.remove(project.port)
 
-        // Build command with environment variables if present
+        // If the port is already bound, kill the existing listener before
+        // spawning a new one. This prevents EADDRINUSE cascades where multiple
+        // restart attempts each open a new Terminal window that immediately
+        // dies because the prior process hasn't released the port yet. Note:
+        // userInitiated:false so this kill doesn't get treated as the user
+        // stopping the project (which would suppress the very restart we want).
+        if isPortActive(project.port) {
+            stopProjectByPort(project.port, userInitiated: false)
+            // Brief pause to give the OS time to release the port before bind.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.openProjectTerminal(project)
+            }
+        } else {
+            openProjectTerminal(project)
+        }
+    }
+
+    /// Build the env-prefixed command and hand off to openTerminal. Split out
+    /// of startProjectDirectly so the port-conflict path can defer the spawn
+    /// without duplicating the command-building logic.
+    @MainActor private func openProjectTerminal(_ project: Project) {
         var command = project.startCommand
         if let envVars = project.envVars, !envVars.isEmpty {
             let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
@@ -1181,7 +1225,6 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         openTerminal(directory: project.directory, command: command)
 
-        // Wait a moment then refresh
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.updateMenu()
         }
