@@ -667,22 +667,11 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var portStatusCache: [Int: PortStatus] = [:]
 
     /// Checks if a process is listening on the specified port.
+    /// Uses a native BSD socket — no subprocess, no fork, can't crash
+    /// under memory pressure (which is why the old lsof-based version
+    /// blew up: NSTask raised an ObjC exception that bypassed `try`).
     func isPortActive(_ port: Int) -> Bool {
-        let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
-        task.arguments = ["-i", ":\(port)", "-sTCP:LISTEN"]
-
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-
-        task.launch()
-        task.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-
-        return !output.isEmpty && output.contains("LISTEN")
+        SafeProcess.isPortActive(port)
     }
 
     /// Checks if a project is healthy by pinging its health check URL.
@@ -724,60 +713,40 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func getResourceUsage(for port: Int) -> (cpu: Double, mem: Double)? {
-        do {
-            // Get PIDs for the port
-            let pidTask = Process()
-            pidTask.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-            pidTask.arguments = ["-t", "-i", ":\(port)"]
+        // Get PIDs for the port. SafeProcess returns nil on launch failure
+        // or ObjC exception (e.g. fork() failing under memory pressure).
+        guard let pidResult = SafeProcess.runCapturingOutput(
+            launchPath: "/usr/sbin/lsof",
+            arguments: ["-t", "-i", ":\(port)"]
+        ) else { return nil }
 
-            let pidPipe = Pipe()
-            pidTask.standardOutput = pidPipe
-            pidTask.standardError = FileHandle.nullDevice
+        let pidOutput = pidResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pidOutput.isEmpty else { return nil }
 
-            try pidTask.run()
-            pidTask.waitUntilExit()
+        let pids = pidOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
+        guard !pids.isEmpty else { return nil }
 
-            let pidData = pidPipe.fileHandleForReading.readDataToEndOfFile()
-            let pidOutput = String(data: pidData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Get resource usage for all PIDs in one ps call
+        guard let psResult = SafeProcess.runCapturingOutput(
+            launchPath: "/bin/ps",
+            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu,%mem"]
+        ) else { return nil }
 
-            guard !pidOutput.isEmpty else { return nil }
+        var totalCpu: Double = 0
+        var totalMem: Double = 0
 
-            let pids = pidOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
-            guard !pids.isEmpty else { return nil }
-
-            // Get resource usage for all PIDs in one ps call
-            let psTask = Process()
-            psTask.executableURL = URL(fileURLWithPath: "/bin/ps")
-            psTask.arguments = ["-p", pids.joined(separator: ","), "-o", "%cpu,%mem"]
-
-            let psPipe = Pipe()
-            psTask.standardOutput = psPipe
-            psTask.standardError = FileHandle.nullDevice
-
-            try psTask.run()
-            psTask.waitUntilExit()
-
-            let psData = psPipe.fileHandleForReading.readDataToEndOfFile()
-            let psOutput = String(data: psData, encoding: .utf8) ?? ""
-
-            var totalCpu: Double = 0
-            var totalMem: Double = 0
-
-            let lines = psOutput.components(separatedBy: "\n")
-            for line in lines.dropFirst() { // Skip header
-                let values = line.trimmingCharacters(in: .whitespaces)
-                    .components(separatedBy: CharacterSet.whitespaces)
-                    .filter { !$0.isEmpty }
-                if values.count >= 2 {
-                    totalCpu += Double(values[0]) ?? 0
-                    totalMem += Double(values[1]) ?? 0
-                }
+        let lines = psResult.stdout.components(separatedBy: "\n")
+        for line in lines.dropFirst() { // Skip header
+            let values = line.trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: CharacterSet.whitespaces)
+                .filter { !$0.isEmpty }
+            if values.count >= 2 {
+                totalCpu += Double(values[0]) ?? 0
+                totalMem += Double(values[1]) ?? 0
             }
-
-            return (totalCpu, totalMem)
-        } catch {
-            return nil
         }
+
+        return (totalCpu, totalMem)
     }
 
     func updateResourceCache() {
@@ -1264,46 +1233,33 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             userStoppedPorts.insert(port)
         }
 
-        let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
         // Only get LISTENING processes (servers), not client connections (browsers)
-        task.arguments = ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
+        guard let result = SafeProcess.runCapturingOutput(
+            launchPath: "/usr/sbin/lsof",
+            arguments: ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
+        ) else { return }
 
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
+        let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { return }
 
-        task.launch()
-        task.waitUntilExit()
+        let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        for pid in pids {
+            // First kill child processes of this PID
+            SafeProcess.runWaitingForExit(
+                launchPath: "/usr/bin/pkill",
+                arguments: ["-9", "-P", pid]
+            )
+            // Then kill the process itself
+            SafeProcess.runWaitingForExit(
+                launchPath: "/bin/kill",
+                arguments: ["-9", pid]
+            )
+        }
 
-        if !output.isEmpty {
-            let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-
-            for pid in pids {
-                // First kill child processes of this PID
-                let pkillTask = Process()
-                pkillTask.launchPath = "/usr/bin/pkill"
-                pkillTask.arguments = ["-9", "-P", pid]
-                pkillTask.standardError = FileHandle.nullDevice
-                pkillTask.launch()
-                pkillTask.waitUntilExit()
-
-                // Then kill the process itself
-                let killTask = Process()
-                killTask.launchPath = "/bin/kill"
-                killTask.arguments = ["-9", pid]
-                killTask.standardError = FileHandle.nullDevice
-                killTask.launch()
-                killTask.waitUntilExit()
-            }
-
-            // Wait a moment then refresh
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.updateMenu()
-            }
+        // Wait a moment then refresh
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.updateMenu()
         }
     }
 
@@ -1445,26 +1401,20 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? plistContent.write(toFile: launchAgentPath(), atomically: true, encoding: .utf8)
 
         // Load the agent
-        let task = Process()
-        task.launchPath = "/bin/launchctl"
-        task.arguments = ["load", launchAgentPath()]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
+        SafeProcess.runWaitingForExit(
+            launchPath: "/bin/launchctl",
+            arguments: ["load", launchAgentPath()]
+        )
     }
 
     private func uninstallLaunchAgent() {
         let path = launchAgentPath()
 
         // Unload the agent
-        let task = Process()
-        task.launchPath = "/bin/launchctl"
-        task.arguments = ["unload", path]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-        try? task.run()
-        task.waitUntilExit()
+        SafeProcess.runWaitingForExit(
+            launchPath: "/bin/launchctl",
+            arguments: ["unload", path]
+        )
 
         // Remove the plist
         try? FileManager.default.removeItem(atPath: path)
