@@ -8,6 +8,7 @@
 
 import Cocoa
 import Foundation
+import os
 import UserNotifications
 
 // MARK: - Data Models
@@ -389,6 +390,8 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
 
 /// The main application delegate that manages the menu bar interface and server monitoring.
 class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    static let launchAgentLog = Logger(subsystem: "com.alexanderhayworth.harbr", category: "LaunchAgent")
+
     var statusItem: NSStatusItem?
     var config: Config?
     var timer: Timer?
@@ -761,29 +764,63 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var newCache: [Int: PortStatus] = [:]
             var stateChanges: [(project: Project, started: Bool)] = []
 
+            // Phase 1 — port + resource sampling (serial, fast).
             for project in projectsCopy {
                 let isActive = self?.isPortActive(project.port) ?? false
                 var cpu: Double? = nil
                 var mem: Double? = nil
-                var healthStatus: Bool? = nil
 
-                if isActive {
-                    if let usage = self?.getResourceUsage(for: project.port) {
-                        cpu = usage.cpu
-                        mem = usage.mem
-                    }
-                    // Check health endpoint if configured
-                    healthStatus = self?.checkProjectHealth(project)
+                if isActive, let usage = self?.getResourceUsage(for: project.port) {
+                    cpu = usage.cpu
+                    mem = usage.mem
                 }
 
-                newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem, healthStatus: healthStatus)
+                newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem, healthStatus: nil)
 
                 // Check for state change using captured snapshot
-                if let previousState = capturedPreviousStates[project.port] {
-                    if previousState != isActive {
-                        stateChanges.append((project: project, started: isActive))
-                    }
+                if let previousState = capturedPreviousStates[project.port],
+                   previousState != isActive {
+                    stateChanges.append((project: project, started: isActive))
                 }
+            }
+
+            // Phase 2 — health checks in parallel. Previously these ran serially
+            // inside Phase 1, blocking the cache update for up to ~4s per
+            // health-checked project; now wall-clock is capped at 5s for all of
+            // them combined. A health check that times out still presents as
+            // "unhealthy" (matches prior behavior via the pre-seed below).
+            let healthGroup = DispatchGroup()
+            let healthLock = NSLock()
+            var healthResults: [Int: Bool] = [:]
+
+            let projectsNeedingHealth = projectsCopy.filter { project in
+                (newCache[project.port]?.isActive ?? false) &&
+                (project.healthCheckUrl?.isEmpty == false)
+            }
+            for project in projectsNeedingHealth {
+                healthResults[project.port] = false  // pessimistic until proven healthy
+            }
+            for project in projectsNeedingHealth {
+                healthGroup.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let result = self?.checkProjectHealth(project) ?? false
+                    healthLock.lock()
+                    healthResults[project.port] = result
+                    healthLock.unlock()
+                    healthGroup.leave()
+                }
+            }
+            _ = healthGroup.wait(timeout: .now() + 5.0)
+
+            // Merge health results back into the cache.
+            for (port, healthy) in healthResults {
+                guard let status = newCache[port] else { continue }
+                newCache[port] = PortStatus(
+                    isActive: status.isActive,
+                    cpuUsage: status.cpuUsage,
+                    memoryUsage: status.memoryUsage,
+                    healthStatus: healthy
+                )
             }
 
             Task { @MainActor [weak self] in
@@ -1074,12 +1111,14 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let statusImage = NSImage(systemSymbolName: statusSymbol, accessibilityDescription: statusDescription) {
             let symbolConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
             let configuredImage = statusImage.withSymbolConfiguration(symbolConfig)
-            item.image?.isTemplate = false
             let tintedImage = NSImage(size: configuredImage?.size ?? statusImage.size, flipped: false) { rect in
                 statusColor.set()
                 (configuredImage ?? statusImage).draw(in: rect)
                 return true
             }
+            // Mark non-template so AppKit doesn't re-tint our hand-colored status dots
+            // on menu highlight (would turn red/yellow/green dots into the selection color).
+            tintedImage.isTemplate = false
             item.image = tintedImage
         }
         let submenu = NSMenu()
@@ -1394,27 +1433,43 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Create LaunchAgents directory if needed
         if !fileManager.fileExists(atPath: launchAgentsDir) {
-            try? fileManager.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+            do {
+                try fileManager.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+            } catch {
+                Self.launchAgentLog.error("Failed to create LaunchAgents directory: \(error.localizedDescription, privacy: .public)")
+                return
+            }
         }
 
         // Write the plist
-        try? plistContent.write(toFile: launchAgentPath(), atomically: true, encoding: .utf8)
+        do {
+            try plistContent.write(toFile: launchAgentPath(), atomically: true, encoding: .utf8)
+        } catch {
+            Self.launchAgentLog.error("Failed to write LaunchAgent plist at \(self.launchAgentPath(), privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return
+        }
 
         // Load the agent
-        SafeProcess.runWaitingForExit(
+        let loaded = SafeProcess.runWaitingForExit(
             launchPath: "/bin/launchctl",
             arguments: ["load", launchAgentPath()]
         )
+        if !loaded {
+            Self.launchAgentLog.error("launchctl load failed for \(self.launchAgentPath(), privacy: .public) — auto-launch at login will not work until investigated")
+        }
     }
 
     private func uninstallLaunchAgent() {
         let path = launchAgentPath()
 
         // Unload the agent
-        SafeProcess.runWaitingForExit(
+        let unloaded = SafeProcess.runWaitingForExit(
             launchPath: "/bin/launchctl",
             arguments: ["unload", path]
         )
+        if !unloaded {
+            Self.launchAgentLog.error("launchctl unload failed for \(path, privacy: .public)")
+        }
 
         // Remove the plist
         try? FileManager.default.removeItem(atPath: path)
@@ -1488,7 +1543,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Cancel")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            config?.projects.removeAll { $0.name == project.name && $0.port == project.port }
+            // Match by port only — it's the unique key. Matching by name+port
+            // silently fails when the user has renamed the project after the
+            // menu was built (the menu item holds the old Project value).
+            config?.projects.removeAll { $0.port == project.port }
             saveConfig()
         }
     }
