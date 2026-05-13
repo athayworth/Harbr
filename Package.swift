@@ -8,8 +8,15 @@ let package = Package(
         .macOS(.v12)
     ],
     targets: [
+        .target(
+            name: "HarbrSafe",
+            path: "Sources/HarbrSafe",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "Harbr",
+            dependencies: ["HarbrSafe"],
+            path: "Sources/Harbr",
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
