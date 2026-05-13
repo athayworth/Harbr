@@ -139,13 +139,14 @@ Harbr stores project configurations in `~/.harbr/config.json`. You can either:
 
 Harbr uses system tools to monitor and manage your development servers:
 
-- **Port detection**: Uses `lsof` to check which ports have active listeners
-- **Health checks**: Uses URLSession to ping health endpoints
-- **Resource monitoring**: Uses `ps` to get CPU and memory usage
-- **Server management**: Uses AppleScript to open Terminal/iTerm/Warp and run commands
-- **Process control**: Uses `kill` and `pkill` to stop servers and child processes
-- **Launch at Login**: Creates a LaunchAgent in `~/Library/LaunchAgents/`
-- **Notifications**: Uses UserNotifications framework for system notifications
+- **Port detection**: Native BSD socket `connect()` to `127.0.0.1:port` — no subprocess, safe under memory pressure. (`lsof` is still used to look up the owning PIDs when stopping or measuring a server.)
+- **Health checks**: URLSession pings health endpoints in parallel; results are capped at a 5s wall-clock window per cache refresh.
+- **Resource monitoring**: Uses `ps` to get CPU and memory usage.
+- **Server management**: Uses AppleScript to open Terminal/iTerm/Warp and run commands.
+- **Process control**: Uses `kill` and `pkill` to stop servers and child processes.
+- **Launch at Login**: Creates a LaunchAgent in `~/Library/LaunchAgents/`.
+- **Notifications**: Uses UserNotifications framework for system notifications.
+- **Subprocess safety**: All `Process` invocations are routed through an Objective-C `@try`/`@catch` bridge (`HarbrSafe`), so an `NSException` raised by `NSConcreteTask` under heavy memory pressure becomes a logged error instead of an `abort()`.
 
 ## License
 
