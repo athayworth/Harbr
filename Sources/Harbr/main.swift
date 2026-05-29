@@ -668,6 +668,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Cache for port status to avoid blocking the menu on each open.
     var portStatusCache: [Int: PortStatus] = [:]
+    /// Monotonic counter incremented on every updateResourceCache call.
+    /// Each background poll captures the value at start and only commits
+    /// its result if it still matches at commit time — older in-flight polls
+    /// (e.g. a 5s timer poll that started before a user-initiated stop) are
+    /// discarded so they can't overwrite fresher state.
+    var pollGeneration: UInt64 = 0
 
     /// Checks if a process is listening on the specified port.
     /// Uses a native BSD socket — no subprocess, no fork, can't crash
@@ -760,6 +766,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let capturedUserStoppedPorts = self.userStoppedPorts
         let projectsCopy = config.projects
 
+        // Bump generation so any older in-flight poll is discarded at commit.
+        pollGeneration &+= 1
+        let myGeneration = pollGeneration
+
         DispatchQueue.global(qos: .background).async { [weak self] in
             var newCache: [Int: PortStatus] = [:]
             var stateChanges: [(project: Project, started: Bool)] = []
@@ -825,6 +835,16 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+
+                // Stale-result guard: a newer poll has been scheduled since
+                // this one started, so its result is more recent — drop ours.
+                // This matters when a user-initiated stop schedules a fresh
+                // poll while a 5s timer poll (which may have read the port
+                // as still-active and then blocked for ~5s on health checks)
+                // is still pending. Without this, the older poll commits
+                // last and the toolbar count freezes at the pre-stop value
+                // until the next timer tick.
+                guard myGeneration == self.pollGeneration else { return }
 
                 // Update previous states
                 for project in projectsCopy {
@@ -1295,6 +1315,22 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 arguments: ["-9", pid]
             )
         }
+
+        // Optimistically reflect the stop in the cache so the toolbar count
+        // and menu update on the next runloop tick rather than after the
+        // 0.5s poll round-trip. The scheduled background poll below will
+        // still run and confirm (or correct, if the kill failed).
+        // Also update previousPortStates so the next poll doesn't see this
+        // as a true→false transition and fire a spurious "Stopped" notification
+        // (we just stopped it, the notification would be redundant).
+        portStatusCache[port] = PortStatus(
+            isActive: false,
+            cpuUsage: nil,
+            memoryUsage: nil,
+            healthStatus: nil
+        )
+        previousPortStates[port] = false
+        rebuildMenu()
 
         // Wait a moment then refresh
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
