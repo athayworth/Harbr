@@ -628,16 +628,27 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        var error: NSDictionary?
-        if let scriptObject = NSAppleScript(source: script) {
-            scriptObject.executeAndReturnError(&error)
-            if let error = error {
-                let errorMessage = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
-                print("AppleScript error: \(error)")
-                showAlert(
-                    title: "Failed to Open Terminal",
-                    message: "Could not open \(terminal.displayName): \(errorMessage)"
-                )
+        let terminalDisplayName = terminal.displayName
+
+        // Run AppleScript off main: NSAppleScript.executeAndReturnError
+        // blocks the calling thread waiting for the AppleEvent reply, and
+        // Terminal.app can take seconds to respond (especially after a
+        // kill -9 burst). Without this, every Start / Restart click froze
+        // the menu bar UI until the target terminal responded.
+        appleScriptQueue.async { [weak self] in
+            var error: NSDictionary?
+            if let scriptObject = NSAppleScript(source: script) {
+                scriptObject.executeAndReturnError(&error)
+                if let error = error {
+                    let errorMessage = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
+                    print("AppleScript error: \(error)")
+                    Task { @MainActor [weak self] in
+                        self?.showAlert(
+                            title: "Failed to Open Terminal",
+                            message: "Could not open \(terminalDisplayName): \(errorMessage)"
+                        )
+                    }
+                }
             }
         }
     }
@@ -650,9 +661,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             activate
         end tell
         """
-        if let scriptObject = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            scriptObject.executeAndReturnError(&error)
+        // Off main for the same reason as openTerminal — activation can
+        // synchronously wait for the target app to come forward.
+        appleScriptQueue.async {
+            if let scriptObject = NSAppleScript(source: script) {
+                var error: NSDictionary?
+                scriptObject.executeAndReturnError(&error)
+            }
         }
     }
 
@@ -674,6 +689,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// (e.g. a 5s timer poll that started before a user-initiated stop) are
     /// discarded so they can't overwrite fresher state.
     var pollGeneration: UInt64 = 0
+    /// Serial queue for NSAppleScript execution. NSAppleScript isn't
+    /// thread-safe, and running it inline on main blocks the UI when
+    /// Terminal/iTerm/Warp is slow to respond (AppleEvents can take many
+    /// seconds, especially right after killing a server). Funneling through
+    /// a dedicated serial queue keeps main responsive while still serializing
+    /// AppleScript invocations against the target app.
+    private let appleScriptQueue = DispatchQueue(label: "com.alexanderhayworth.harbr.applescript", qos: .userInitiated)
 
     /// Checks if a process is listening on the specified port.
     /// Uses a native BSD socket — no subprocess, no fork, can't crash
@@ -1253,9 +1275,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // userInitiated:false so this kill doesn't get treated as the user
         // stopping the project (which would suppress the very restart we want).
         if isPortActive(project.port) {
-            stopProjectByPort(project.port, userInitiated: false)
-            // Brief pause to give the OS time to release the port before bind.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            stopProjectByPort(project.port, userInitiated: false) { [weak self] in
+                // Completion already fires after stopProjectByPort's built-in
+                // 0.5s grace; spawn the new terminal immediately from there.
                 self?.openProjectTerminal(project)
             }
         } else {
@@ -1287,42 +1309,19 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopProjectByPort(project.port)
     }
 
-    @MainActor func stopProjectByPort(_ port: Int, userInitiated: Bool = true) {
+    @MainActor func stopProjectByPort(
+        _ port: Int,
+        userInitiated: Bool = true,
+        completion: (() -> Void)? = nil
+    ) {
         if userInitiated {
             userStoppedPorts.insert(port)
         }
 
-        // Only get LISTENING processes (servers), not client connections (browsers)
-        guard let result = SafeProcess.runCapturingOutput(
-            launchPath: "/usr/sbin/lsof",
-            arguments: ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
-        ) else { return }
-
-        let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !output.isEmpty else { return }
-
-        let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-
-        for pid in pids {
-            // First kill child processes of this PID
-            SafeProcess.runWaitingForExit(
-                launchPath: "/usr/bin/pkill",
-                arguments: ["-9", "-P", pid]
-            )
-            // Then kill the process itself
-            SafeProcess.runWaitingForExit(
-                launchPath: "/bin/kill",
-                arguments: ["-9", pid]
-            )
-        }
-
-        // Optimistically reflect the stop in the cache so the toolbar count
-        // and menu update on the next runloop tick rather than after the
-        // 0.5s poll round-trip. The scheduled background poll below will
-        // still run and confirm (or correct, if the kill failed).
-        // Also update previousPortStates so the next poll doesn't see this
-        // as a true→false transition and fire a spurious "Stopped" notification
-        // (we just stopped it, the notification would be redundant).
+        // Optimistic UI update first — toolbar count and menu reflect the
+        // stop immediately, without waiting on the kill subprocesses or
+        // the next poll. previousPortStates is pinned to false so the
+        // confirming poll doesn't fire a redundant "Stopped" notification.
         portStatusCache[port] = PortStatus(
             isActive: false,
             cpuUsage: nil,
@@ -1332,9 +1331,44 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         previousPortStates[port] = false
         rebuildMenu()
 
-        // Wait a moment then refresh
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.updateMenu()
+        // Run lsof/pkill/kill off main: runWaitingForExit has no timeout,
+        // so a stuck subprocess would freeze the UI forever. Even when the
+        // subprocesses are fast (~tens of ms each), keeping them off main
+        // means clicks like Stop / Restart never block the menu bar.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer {
+                // 0.5s grace lets the OS fully reap the killed process and
+                // release the port before the next poll re-reads state, and
+                // before any chained start (via completion) tries to bind.
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    self?.updateMenu()
+                    completion?()
+                }
+            }
+
+            guard let result = SafeProcess.runCapturingOutput(
+                launchPath: "/usr/sbin/lsof",
+                arguments: ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
+            ) else { return }
+
+            let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !output.isEmpty else { return }
+
+            let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
+
+            for pid in pids {
+                // First kill child processes of this PID
+                SafeProcess.runWaitingForExit(
+                    launchPath: "/usr/bin/pkill",
+                    arguments: ["-9", "-P", pid]
+                )
+                // Then kill the process itself
+                SafeProcess.runWaitingForExit(
+                    launchPath: "/bin/kill",
+                    arguments: ["-9", pid]
+                )
+            }
         }
     }
 
@@ -1344,11 +1378,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor func restartProjectDirectly(_ project: Project) {
-        // Stop first
-        stopProjectByPort(project.port)
-
-        // Wait for processes to fully terminate, then start
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        // Chain start off stop's completion rather than a hardcoded 1s wait.
+        // stopProjectByPort dispatches kills to a background queue and fires
+        // completion after a 0.5s grace, so we're guaranteed the kill
+        // subprocesses have actually exited before we try to spawn the new
+        // terminal — previously the 1s timer could race with a slow kill.
+        stopProjectByPort(project.port) { [weak self] in
             self?.startProjectDirectly(project)
         }
     }
