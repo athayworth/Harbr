@@ -390,7 +390,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
 
 /// The main application delegate that manages the menu bar interface and server monitoring.
 class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    static let launchAgentLog = Logger(subsystem: "com.alexanderhayworth.harbr", category: "LaunchAgent")
+    static let launchAgentLog = Logger(subsystem: "com.harbr.app", category: "LaunchAgent")
 
     var statusItem: NSStatusItem?
     var config: Config?
@@ -695,7 +695,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// seconds, especially right after killing a server). Funneling through
     /// a dedicated serial queue keeps main responsive while still serializing
     /// AppleScript invocations against the target app.
-    private let appleScriptQueue = DispatchQueue(label: "com.alexanderhayworth.harbr.applescript", qos: .userInitiated)
+    private let appleScriptQueue = DispatchQueue(label: "com.harbr.app.applescript", qos: .userInitiated)
 
     /// Checks if a process is listening on the specified port.
     /// Uses a native BSD socket — no subprocess, no fork, can't crash
@@ -1542,7 +1542,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func launchAgentPath() -> String {
-        return NSString(string: "~/Library/LaunchAgents/com.alexanderhayworth.harbr.plist").expandingTildeInPath
+        return NSString(string: "~/Library/LaunchAgents/com.harbr.app.plist").expandingTildeInPath
     }
 
     private func installLaunchAgent() {
@@ -1556,7 +1556,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         <plist version="1.0">
         <dict>
             <key>Label</key>
-            <string>com.alexanderhayworth.harbr</string>
+            <string>com.harbr.app</string>
             <key>ProgramArguments</key>
             <array>
                 <string>\(appPath)</string>

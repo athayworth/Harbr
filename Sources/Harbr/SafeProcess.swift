@@ -8,7 +8,7 @@ import os
 /// can raise an Objective-C exception that bypasses Swift's `try` and
 /// triggers `abort()`. All call sites in the app should go through here.
 enum SafeProcess {
-    private static let log = Logger(subsystem: "com.alexanderhayworth.harbr", category: "SafeProcess")
+    private static let log = Logger(subsystem: "com.harbr.app", category: "SafeProcess")
 
     // MARK: Port check
 

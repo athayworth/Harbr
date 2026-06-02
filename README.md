@@ -36,7 +36,8 @@ cd Harbr
 ./scripts/install.sh
 ```
 
-This builds and installs Harbr to `/Applications/Harbr.app`.
+This builds, ad-hoc codesigns, and installs Harbr to `/Applications/Harbr.app`.
+Requires Swift 6.1+ (Xcode 16 or the standalone toolchain).
 
 ### Build from Source (CLI)
 
@@ -46,6 +47,38 @@ swift build -c release
 ```
 
 The app will appear in your menu bar with a sailboat icon.
+
+### First Launch
+
+On first launch you'll hit two one-time macOS prompts. Both are expected:
+
+1. **Automation permission** ("Harbr would like to control Terminal") — fires
+   the first time you click Start/Stop/Restart. Approve it so Harbr can spawn
+   dev-server windows. You can revoke this later in
+   *System Settings → Privacy & Security → Automation*.
+2. **Notifications permission** — fires shortly after launch. Approve to get
+   start/stop/auto-restart notifications, or skip if you'd rather not.
+
+If you downloaded a prebuilt `Harbr.app` rather than building from source,
+Gatekeeper may say *"Harbr can't be opened because Apple cannot check it for
+malicious software."* Right-click the app and pick **Open** to bypass once;
+subsequent launches work normally. (The install script clears the quarantine
+attribute for you, so this only applies to manually-downloaded binaries.)
+
+### Building a signed distribution
+
+The default build is ad-hoc signed (`codesign --sign -`), which works on the
+machine that built it but Gatekeeper will still warn other users on download.
+To produce a build you can hand to someone else, set `CODESIGN_IDENTITY` to a
+Developer ID Application identity from your keychain:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+  ./scripts/build-app.sh
+```
+
+Full notarization (`xcrun notarytool`) is left to you — Harbr's build scripts
+stop at signing.
 
 ## Configuration
 

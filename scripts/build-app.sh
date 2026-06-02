@@ -37,6 +37,13 @@ else
     echo "Warning: AppIcon.icns not found, app will use default icon"
 fi
 
+# Ad-hoc codesign so recent macOS will let the app request Automation /
+# Notifications permissions. Set CODESIGN_IDENTITY to your Developer ID
+# string if you have one (e.g. "Developer ID Application: Your Name (TEAMID)").
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+echo "Codesigning with identity: $CODESIGN_IDENTITY"
+codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_BUNDLE"
+
 echo ""
 echo "✅ Build complete!"
 echo ""
