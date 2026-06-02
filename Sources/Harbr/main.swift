@@ -299,8 +299,97 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         openPanel.beginSheetModal(for: window) { [weak self] response in
             if response == .OK, let url = openPanel.url {
                 self?.directoryField?.stringValue = url.path
+                self?.applyPackageJsonDefaults(forDirectory: url.path)
             }
         }
+    }
+
+    /// Reads package.json (if present) and pre-fills any empty fields with
+    /// sensible defaults — name from the package, command from scripts.dev /
+    /// start / serve, port from the script flags or the framework's default.
+    /// Only fills empty fields so we never clobber a value the user typed.
+    /// Vibe-coder targeting: most users picking a Next.js / Vite folder
+    /// shouldn't have to know what port their framework binds to.
+    @MainActor private func applyPackageJsonDefaults(forDirectory dir: String) {
+        let pkgPath = (dir as NSString).appendingPathComponent("package.json")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: pkgPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+
+        if (nameField?.stringValue.isEmpty ?? false),
+           let pkgName = json["name"] as? String, !pkgName.isEmpty {
+            // "my-cool-app" → "My Cool App". Scoped packages ("@org/pkg") get
+            // the scope stripped because the app's display name shouldn't
+            // leak the npm namespace.
+            let stripped = pkgName.split(separator: "/").last.map(String.init) ?? pkgName
+            let titled = stripped
+                .replacingOccurrences(of: "-", with: " ")
+                .replacingOccurrences(of: "_", with: " ")
+                .split(separator: " ")
+                .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+                .joined(separator: " ")
+            nameField?.stringValue = titled
+        }
+
+        let scripts = (json["scripts"] as? [String: String]) ?? [:]
+        var chosenScriptName: String?
+        var chosenScriptBody: String?
+        for candidate in ["dev", "start", "serve"] {
+            if let body = scripts[candidate] {
+                chosenScriptName = candidate
+                chosenScriptBody = body
+                break
+            }
+        }
+
+        if (startCommandField?.stringValue.isEmpty ?? false), let scriptName = chosenScriptName {
+            startCommandField?.stringValue = "npm run \(scriptName)"
+        }
+
+        if portField?.stringValue.isEmpty ?? false {
+            if let body = chosenScriptBody, let detected = detectPort(from: body) {
+                portField?.stringValue = "\(detected)"
+            } else {
+                let deps = (json["dependencies"] as? [String: Any]) ?? [:]
+                let devDeps = (json["devDependencies"] as? [String: Any]) ?? [:]
+                let allDeps = Set(deps.keys).union(devDeps.keys)
+                let defaultPort: Int? = {
+                    if allDeps.contains("next") { return 3000 }
+                    if allDeps.contains("vite") { return 5173 }
+                    if allDeps.contains("astro") { return 4321 }
+                    if allDeps.contains("remix") || allDeps.contains("@remix-run/dev") { return 3000 }
+                    if allDeps.contains("react-scripts") { return 3000 }
+                    if allDeps.contains("@sveltejs/kit") { return 5173 }
+                    if allDeps.contains("nuxt") { return 3000 }
+                    return nil
+                }()
+                if let port = defaultPort {
+                    portField?.stringValue = "\(port)"
+                }
+            }
+        }
+    }
+
+    /// Pulls a port number out of a dev-script string. Handles `-p 3001`,
+    /// `--port=3001`, and `PORT=3001 next dev`. Stops at the first match
+    /// because in practice scripts don't specify a port twice.
+    private func detectPort(from script: String) -> Int? {
+        let patterns = [
+            #"--port[=\s]+(\d+)"#,
+            #"\s-p[=\s]+(\d+)"#,
+            #"\bPORT=(\d+)"#
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let nsRange = NSRange(script.startIndex..., in: script)
+            guard let match = regex.firstMatch(in: script, range: nsRange),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: script),
+                  let port = Int(script[range]) else { continue }
+            return port
+        }
+        return nil
     }
 
     @MainActor @objc func save() {
@@ -1133,6 +1222,51 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = "\(project.name)  :\(project.port)"
 
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+
+        // Surface CPU/MEM on the top-level line when active — previously
+        // these were only visible inside each project's submenu, so users
+        // had to hover one by one to find what was hot. Show as a muted
+        // suffix so idle/healthy projects stay visually quiet and a hot
+        // one stands out without us needing a separate alert.
+        if status.isActive, let cpu = status.cpuUsage, let mem = status.memoryUsage {
+            let primary = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            // Tint the CPU figure when it's elevated so the eye lands on it
+            // immediately. 20% is the threshold where a dev server feels
+            // sluggish; >50% usually means something's stuck in a loop.
+            let cpuColor: NSColor = cpu >= 50 ? .systemRed
+                                   : cpu >= 20 ? .systemOrange
+                                   : .secondaryLabelColor
+            let suffix = NSMutableAttributedString(
+                string: "   ·   ",
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.tertiaryLabelColor
+                ]
+            )
+            suffix.append(NSAttributedString(
+                string: String(format: "%.0f%%", cpu),
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular),
+                    .foregroundColor: cpuColor
+                ]
+            ))
+            suffix.append(NSAttributedString(
+                string: String(format: "  %.0f%%", mem),
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            ))
+            let combined = NSMutableAttributedString(attributedString: primary)
+            combined.append(suffix)
+            item.attributedTitle = combined
+        }
 
         // Use SF Symbols for status
         // Green = running & healthy, Yellow = running but unhealthy, Gray = stopped
