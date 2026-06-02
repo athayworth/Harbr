@@ -44,14 +44,21 @@ struct Project: Codable {
     let healthCheckUrl: String?
     let envVars: [String: String]?
     let autoRestart: Bool?
+    /// Whether to wrap the start command with `script -q` to capture stdout
+    /// to a log file Harbr can tail. Defaults to true — the Activity tab
+    /// is useless without it. Opt-out exists for edge cases (Docker Compose
+    /// allocating its own TTY, custom wrappers that don't survive an outer
+    /// PTY) where wrapping breaks the user's setup.
+    let captureLogs: Bool?
 
-    /// Whether to auto-restart if the server crashes.
     var shouldAutoRestart: Bool { autoRestart ?? false }
+    var shouldCaptureLogs: Bool { captureLogs ?? true }
 
     /// Creates a project with default optional values.
     init(name: String, port: Int, directory: String, startCommand: String,
          group: String? = nil, healthCheckUrl: String? = nil,
-         envVars: [String: String]? = nil, autoRestart: Bool? = nil) {
+         envVars: [String: String]? = nil, autoRestart: Bool? = nil,
+         captureLogs: Bool? = nil) {
         self.name = name
         self.port = port
         self.directory = directory
@@ -60,6 +67,7 @@ struct Project: Codable {
         self.healthCheckUrl = healthCheckUrl
         self.envVars = envVars
         self.autoRestart = autoRestart
+        self.captureLogs = captureLogs
     }
 }
 
@@ -101,6 +109,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     var groupField: NSTextField?
     var healthCheckField: NSTextField?
     var autoRestartCheckbox: NSButton?
+    var captureLogsCheckbox: NSButton?
     var onSave: ((Project) -> Void)?
     /// Called when the editor is dismissed (save, cancel, or window close button).
     var onDismiss: (() -> Void)?
@@ -113,7 +122,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         self.existingEnvVars = project?.envVars
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 370),
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 408),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -137,7 +146,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         let fieldX: CGFloat = 130
         let fieldWidth: CGFloat = 290
         let rowHeight: CGFloat = 36
-        var currentY: CGFloat = 200
+        var currentY: CGFloat = 238
 
         // Name field
         let nameLabel = NSTextField(labelWithString: "Name")
@@ -262,6 +271,20 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         autoRestartCheckbox?.font = NSFont.systemFont(ofSize: 13)
         autoRestartCheckbox?.state = (project?.autoRestart ?? false) ? .on : .off
         if let checkbox = autoRestartCheckbox {
+            contentView.addSubview(checkbox)
+        }
+
+        currentY -= 24
+
+        // Capture-logs checkbox. Default is on for new projects so the
+        // Activity tab is useful out of the box; existing projects without
+        // the field default to on too (shouldCaptureLogs has nil → true).
+        captureLogsCheckbox = NSButton(frame: NSRect(x: fieldX, y: currentY - 2, width: fieldWidth, height: 20))
+        captureLogsCheckbox?.setButtonType(.switch)
+        captureLogsCheckbox?.title = "Capture output for the Activity tab"
+        captureLogsCheckbox?.font = NSFont.systemFont(ofSize: 13)
+        captureLogsCheckbox?.state = (project?.shouldCaptureLogs ?? true) ? .on : .off
+        if let checkbox = captureLogsCheckbox {
             contentView.addSubview(checkbox)
         }
 
@@ -435,6 +458,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         let group = groupField?.stringValue.isEmpty == false ? groupField?.stringValue : nil
         let healthCheckUrl = healthCheckField?.stringValue.isEmpty == false ? healthCheckField?.stringValue : nil
         let autoRestart = autoRestartCheckbox?.state == .on
+        let captureLogs = captureLogsCheckbox?.state == .on
 
         let project = Project(
             name: name,
@@ -444,7 +468,8 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             group: group,
             healthCheckUrl: healthCheckUrl,
             envVars: existingEnvVars,
-            autoRestart: autoRestart
+            autoRestart: autoRestart,
+            captureLogs: captureLogs
         )
 
         onSave?(project)
@@ -904,6 +929,695 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - Main Window
+
+/// Tabs in the desktop window's sidebar. Kept as a string enum so the
+/// title doubles as the sidebar row label and the value is stable for
+/// future settings persistence.
+enum MainWindowTab: String, CaseIterable {
+    case projects = "Projects"
+    case activity = "Activity"
+    case settings = "Settings"
+
+    var sfSymbol: String {
+        switch self {
+        case .projects: return "list.bullet.rectangle"
+        case .activity: return "text.alignleft"
+        case .settings: return "gearshape"
+        }
+    }
+}
+
+/// The desktop window — a sidebar + content area surface where users can
+/// see all their projects in a sortable table, peek at recent server
+/// output, and adjust app-wide settings. The menu bar dropdown stays the
+/// primary surface; this window is the "deep view" for things that don't
+/// fit a 300px-wide menu.
+///
+/// Built as one window with three swappable content views rather than
+/// NSTabViewController because the parent project doesn't use view
+/// controllers and the visual design we want (sidebar selection driving
+/// the right pane) is simpler with manual view swapping.
+class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    weak var app: HarbrApp?
+    var window: NSWindow?
+
+    private var sidebar: NSTableView?
+    private var contentContainer: NSView?
+    private var currentTab: MainWindowTab = .projects
+
+    // Projects tab
+    private var projectsTable: NSTableView?
+
+    // Activity tab
+    private var activityProjectList: NSTableView?
+    private var activityTextView: NSTextView?
+    private var activityRefreshTimer: Timer?
+    private var activitySelectedPort: Int?
+
+    // Settings tab
+    private var terminalPopup: NSPopUpButton?
+    private var notificationsCheckbox: NSButton?
+    private var launchAtLoginCheckbox: NSButton?
+    private var captureLogsDefaultLabel: NSTextField?
+
+    var onDismiss: (() -> Void)?
+    private var didDismiss = false
+
+    @MainActor init(app: HarbrApp) {
+        self.app = app
+        super.init()
+        buildWindow()
+    }
+
+    @MainActor private func buildWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 560),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Harbr"
+        window.center()
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 720, height: 420)
+        if #available(macOS 11.0, *) {
+            window.titlebarAppearsTransparent = false
+            window.toolbarStyle = .unified
+        }
+        self.window = window
+
+        guard let content = window.contentView else { return }
+
+        // Sidebar
+        let sidebarWidth: CGFloat = 180
+        let sidebarContainer = NSView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
+        sidebarContainer.wantsLayer = true
+        sidebarContainer.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        sidebarContainer.autoresizingMask = [.height]
+        content.addSubview(sidebarContainer)
+
+        let sidebarScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
+        sidebarScroll.hasVerticalScroller = false
+        sidebarScroll.drawsBackground = false
+        sidebarScroll.borderType = .noBorder
+        sidebarScroll.autoresizingMask = [.height, .width]
+        sidebarContainer.addSubview(sidebarScroll)
+
+        let sidebar = NSTableView()
+        sidebar.headerView = nil
+        sidebar.backgroundColor = .clear
+        sidebar.style = .sourceList
+        sidebar.allowsEmptySelection = false
+        sidebar.allowsMultipleSelection = false
+        let sidebarCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("sidebar"))
+        sidebarCol.width = sidebarWidth
+        sidebar.addTableColumn(sidebarCol)
+        sidebar.dataSource = self
+        sidebar.delegate = self
+        sidebar.target = self
+        sidebar.action = #selector(sidebarClicked)
+        sidebarScroll.documentView = sidebar
+        self.sidebar = sidebar
+
+        // Divider
+        let divider = NSBox(frame: NSRect(x: sidebarWidth, y: 0, width: 1, height: 560))
+        divider.boxType = .separator
+        divider.autoresizingMask = [.height]
+        content.addSubview(divider)
+
+        // Content container
+        let container = NSView(frame: NSRect(x: sidebarWidth + 1, y: 0, width: 880 - sidebarWidth - 1, height: 560))
+        container.autoresizingMask = [.height, .width]
+        content.addSubview(container)
+        self.contentContainer = container
+
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        switchTo(.projects)
+    }
+
+    // MARK: Sidebar
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        if tableView === sidebar { return MainWindowTab.allCases.count }
+        if tableView === activityProjectList { return app?.config?.projects.count ?? 0 }
+        if tableView === projectsTable { return app?.config?.projects.count ?? 0 }
+        return 0
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === sidebar {
+            let tab = MainWindowTab.allCases[row]
+            let cell = NSTableCellView()
+            let icon = NSImageView(frame: NSRect(x: 8, y: 4, width: 20, height: 20))
+            icon.image = NSImage(systemSymbolName: tab.sfSymbol, accessibilityDescription: tab.rawValue)
+            icon.contentTintColor = .secondaryLabelColor
+            cell.addSubview(icon)
+            let label = NSTextField(labelWithString: tab.rawValue)
+            label.frame = NSRect(x: 36, y: 4, width: 130, height: 20)
+            label.font = NSFont.systemFont(ofSize: 13)
+            cell.addSubview(label)
+            return cell
+        }
+        if tableView === activityProjectList {
+            guard let project = app?.config?.projects[safe: row] else { return nil }
+            let cell = NSTableCellView()
+            let dot = NSImageView(frame: NSRect(x: 6, y: 7, width: 12, height: 12))
+            let active = app?.portStatusCache[project.port]?.isActive ?? false
+            dot.image = NSImage(systemSymbolName: active ? "circle.fill" : "circle",
+                                accessibilityDescription: active ? "Running" : "Stopped")
+            dot.contentTintColor = active ? .systemGreen : .tertiaryLabelColor
+            cell.addSubview(dot)
+            let label = NSTextField(labelWithString: "\(project.name)  :\(project.port)")
+            label.frame = NSRect(x: 26, y: 4, width: 220, height: 20)
+            label.font = NSFont.systemFont(ofSize: 12)
+            label.lineBreakMode = .byTruncatingTail
+            cell.addSubview(label)
+            return cell
+        }
+        if tableView === projectsTable, let id = tableColumn?.identifier.rawValue {
+            return projectsCellView(forColumn: id, row: row)
+        }
+        return nil
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if tableView === sidebar { return 28 }
+        if tableView === activityProjectList { return 26 }
+        return 28
+    }
+
+    @MainActor @objc private func sidebarClicked() {
+        guard let row = sidebar?.selectedRow, row >= 0 else { return }
+        switchTo(MainWindowTab.allCases[row])
+    }
+
+    @MainActor private func switchTo(_ tab: MainWindowTab) {
+        currentTab = tab
+        // Tear down per-tab state so the Activity timer doesn't keep firing
+        // while we're looking at Settings.
+        activityRefreshTimer?.invalidate()
+        activityRefreshTimer = nil
+        contentContainer?.subviews.forEach { $0.removeFromSuperview() }
+        guard let container = contentContainer else { return }
+        switch tab {
+        case .projects: buildProjectsTab(in: container)
+        case .activity: buildActivityTab(in: container)
+        case .settings: buildSettingsTab(in: container)
+        }
+    }
+
+    // MARK: Projects tab
+
+    @MainActor private func buildProjectsTab(in container: NSView) {
+        let bounds = container.bounds
+
+        let title = NSTextField(labelWithString: "Your Projects")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        title.frame = NSRect(x: 20, y: bounds.height - 44, width: 400, height: 28)
+        title.autoresizingMask = [.minYMargin]
+        container.addSubview(title)
+
+        // Action toolbar — Start All / Stop All / Scan / Add
+        let scanButton = NSButton(title: "Scan Folder", target: app, action: #selector(HarbrApp.scanForProjects))
+        scanButton.bezelStyle = .rounded
+        scanButton.frame = NSRect(x: bounds.width - 220, y: bounds.height - 44, width: 100, height: 28)
+        scanButton.autoresizingMask = [.minXMargin, .minYMargin]
+        container.addSubview(scanButton)
+
+        let addButton = NSButton(title: "Add Project", target: app, action: #selector(HarbrApp.addNewProject))
+        addButton.bezelStyle = .rounded
+        addButton.frame = NSRect(x: bounds.width - 116, y: bounds.height - 44, width: 96, height: 28)
+        addButton.autoresizingMask = [.minXMargin, .minYMargin]
+        if #available(macOS 11.0, *) { addButton.bezelColor = .controlAccentColor }
+        container.addSubview(addButton)
+
+        // Table
+        let tableScroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: bounds.width - 40, height: bounds.height - 84))
+        tableScroll.hasVerticalScroller = true
+        tableScroll.borderType = .lineBorder
+        tableScroll.autoresizingMask = [.width, .height]
+
+        let table = NSTableView()
+        table.usesAlternatingRowBackgroundColors = true
+        table.rowSizeStyle = .default
+        table.allowsEmptySelection = true
+        table.allowsMultipleSelection = false
+        table.style = .inset
+        table.doubleAction = #selector(projectsTableDoubleClicked)
+        table.target = self
+
+        let columns: [(String, String, CGFloat)] = [
+            ("status", "", 24),
+            ("name", "Name", 180),
+            ("port", "Port", 60),
+            ("cpu", "CPU", 70),
+            ("mem", "Memory", 90),
+            ("framework", "Type", 100),
+            ("actions", "", 200)
+        ]
+        for (id, title, width) in columns {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            col.title = title
+            col.width = width
+            col.minWidth = width * 0.6
+            table.addTableColumn(col)
+        }
+        table.dataSource = self
+        table.delegate = self
+        tableScroll.documentView = table
+        container.addSubview(tableScroll)
+        self.projectsTable = table
+        table.reloadData()
+    }
+
+    @MainActor private func projectsCellView(forColumn id: String, row: Int) -> NSView? {
+        guard let project = app?.config?.projects[safe: row] else { return nil }
+        let status = app?.portStatusCache[project.port]
+        let cell = NSTableCellView()
+        switch id {
+        case "status":
+            let dot = NSImageView(frame: NSRect(x: 4, y: 6, width: 14, height: 14))
+            let active = status?.isActive ?? false
+            let unhealthy = active && status?.healthStatus == false
+            dot.image = NSImage(systemSymbolName: active ? "circle.fill" : "circle",
+                                accessibilityDescription: active ? "Running" : "Stopped")
+            dot.contentTintColor = unhealthy ? .systemYellow
+                                  : active ? .systemGreen
+                                  : .tertiaryLabelColor
+            cell.addSubview(dot)
+        case "name":
+            let label = NSTextField(labelWithString: project.name)
+            label.frame = NSRect(x: 0, y: 4, width: 200, height: 20)
+            label.lineBreakMode = .byTruncatingTail
+            cell.addSubview(label)
+        case "port":
+            let label = NSTextField(labelWithString: "\(project.port)")
+            label.frame = NSRect(x: 0, y: 4, width: 60, height: 20)
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            cell.addSubview(label)
+        case "cpu":
+            let val = (status?.isActive == true) ? (status?.cpuUsage).map { String(format: "%.1f%%", $0) } ?? "—" : "—"
+            let label = NSTextField(labelWithString: val)
+            label.frame = NSRect(x: 0, y: 4, width: 70, height: 20)
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            cell.addSubview(label)
+        case "mem":
+            let val = (status?.isActive == true) ? (status?.memoryUsage).map { HarbrApp.formatMemory($0) } ?? "—" : "—"
+            let label = NSTextField(labelWithString: val)
+            label.frame = NSRect(x: 0, y: 4, width: 90, height: 20)
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            cell.addSubview(label)
+        case "framework":
+            // Best-effort: re-parse package.json once per row build. Cheap
+            // because it's only the rows currently scrolled into view.
+            let pkgPath = (project.directory as NSString).appendingPathComponent("package.json")
+            var framework = "—"
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: pkgPath)),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let deps = (json["dependencies"] as? [String: Any]) ?? [:]
+                let devDeps = (json["devDependencies"] as? [String: Any]) ?? [:]
+                let allDeps = Set(deps.keys).union(devDeps.keys)
+                if allDeps.contains("next") { framework = "Next.js" }
+                else if allDeps.contains("vite") { framework = "Vite" }
+                else if allDeps.contains("astro") { framework = "Astro" }
+                else if allDeps.contains("@sveltejs/kit") { framework = "SvelteKit" }
+                else if allDeps.contains("nuxt") { framework = "Nuxt" }
+                else if allDeps.contains("remix") || allDeps.contains("@remix-run/dev") { framework = "Remix" }
+                else if allDeps.contains("react-scripts") { framework = "CRA" }
+                else if allDeps.contains("express") { framework = "Express" }
+                else if allDeps.contains("fastify") { framework = "Fastify" }
+            }
+            let label = NSTextField(labelWithString: framework)
+            label.frame = NSRect(x: 0, y: 4, width: 100, height: 20)
+            label.textColor = .secondaryLabelColor
+            label.font = NSFont.systemFont(ofSize: 12)
+            cell.addSubview(label)
+        case "actions":
+            let active = status?.isActive ?? false
+            let primary = NSButton(title: active ? "Restart" : "Start",
+                                   target: self,
+                                   action: active ? #selector(restartFromTable(_:)) : #selector(startFromTable(_:)))
+            primary.bezelStyle = .rounded
+            primary.controlSize = .small
+            primary.tag = row
+            primary.frame = NSRect(x: 0, y: 4, width: 76, height: 22)
+            cell.addSubview(primary)
+
+            if active {
+                let stop = NSButton(title: "Stop", target: self, action: #selector(stopFromTable(_:)))
+                stop.bezelStyle = .rounded
+                stop.controlSize = .small
+                stop.tag = row
+                stop.frame = NSRect(x: 84, y: 4, width: 60, height: 22)
+                cell.addSubview(stop)
+            }
+        default:
+            break
+        }
+        return cell
+    }
+
+    @MainActor @objc private func projectsTableDoubleClicked() {
+        guard let row = projectsTable?.selectedRow, row >= 0,
+              let project = app?.config?.projects[safe: row] else { return }
+        let active = app?.portStatusCache[project.port]?.isActive ?? false
+        if active {
+            app?.restartProjectDirectly(project)
+        } else {
+            app?.startProjectDirectly(project)
+        }
+    }
+
+    @MainActor @objc private func startFromTable(_ sender: NSButton) {
+        guard let project = app?.config?.projects[safe: sender.tag] else { return }
+        app?.startProjectDirectly(project)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.projectsTable?.reloadData()
+        }
+    }
+
+    @MainActor @objc private func stopFromTable(_ sender: NSButton) {
+        guard let project = app?.config?.projects[safe: sender.tag] else { return }
+        app?.stopProjectByPort(project.port)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.projectsTable?.reloadData()
+        }
+    }
+
+    @MainActor @objc private func restartFromTable(_ sender: NSButton) {
+        guard let project = app?.config?.projects[safe: sender.tag] else { return }
+        app?.restartProjectDirectly(project)
+    }
+
+    // MARK: Activity tab
+
+    @MainActor private func buildActivityTab(in container: NSView) {
+        let bounds = container.bounds
+
+        let title = NSTextField(labelWithString: "Activity")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        title.frame = NSRect(x: 20, y: bounds.height - 44, width: 200, height: 28)
+        title.autoresizingMask = [.minYMargin]
+        container.addSubview(title)
+
+        let hint = NSTextField(labelWithString: "Recent output from each project. Updated every second.")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: 20, y: bounds.height - 64, width: 500, height: 16)
+        hint.autoresizingMask = [.minYMargin]
+        container.addSubview(hint)
+
+        // Left: project picker
+        let leftWidth: CGFloat = 240
+        let leftScroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: leftWidth, height: bounds.height - 100))
+        leftScroll.hasVerticalScroller = true
+        leftScroll.borderType = .lineBorder
+        leftScroll.autoresizingMask = [.height]
+        let leftTable = NSTableView()
+        leftTable.headerView = nil
+        leftTable.allowsEmptySelection = true
+        leftTable.allowsMultipleSelection = false
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("project"))
+        col.width = leftWidth
+        leftTable.addTableColumn(col)
+        leftTable.dataSource = self
+        leftTable.delegate = self
+        leftTable.target = self
+        leftTable.action = #selector(activityProjectClicked)
+        leftScroll.documentView = leftTable
+        container.addSubview(leftScroll)
+        self.activityProjectList = leftTable
+
+        // Right: log text view
+        let rightX: CGFloat = 20 + leftWidth + 12
+        let rightScroll = NSScrollView(frame: NSRect(x: rightX, y: 20, width: bounds.width - rightX - 20, height: bounds.height - 100))
+        rightScroll.hasVerticalScroller = true
+        rightScroll.borderType = .lineBorder
+        rightScroll.autoresizingMask = [.height, .width]
+        let textView = NSTextView()
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.isEditable = false
+        textView.isRichText = false
+        textView.backgroundColor = NSColor(white: 0.10, alpha: 1.0)
+        textView.textColor = NSColor(white: 0.92, alpha: 1.0)
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = "Pick a project to see its recent output."
+        rightScroll.documentView = textView
+        container.addSubview(rightScroll)
+        self.activityTextView = textView
+
+        // Auto-select first project so the panel isn't empty.
+        if let first = app?.config?.projects.first {
+            activitySelectedPort = first.port
+            leftTable.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            refreshActivityText()
+        }
+
+        // Tail at 1Hz; cheap because tail() reads at most maxBytes.
+        activityRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshActivityText()
+            }
+        }
+    }
+
+    @MainActor @objc private func activityProjectClicked() {
+        guard let row = activityProjectList?.selectedRow, row >= 0,
+              let project = app?.config?.projects[safe: row] else { return }
+        activitySelectedPort = project.port
+        refreshActivityText()
+    }
+
+    @MainActor private func refreshActivityText() {
+        guard let port = activitySelectedPort, let textView = activityTextView else { return }
+        let path = HarbrApp.logPath(forPort: port)
+        if !FileManager.default.fileExists(atPath: path) {
+            let project = app?.config?.projects.first(where: { $0.port == port })
+            let name = project?.name ?? "Project"
+            let captureOn = project?.shouldCaptureLogs ?? true
+            textView.string = captureOn
+                ? "\(name) hasn't produced any output yet. Start it from the Projects tab."
+                : "Log capture is off for \(name). Turn it on in the project's editor to see output here."
+            return
+        }
+        let body = LogReader.tail(path: path, lines: 800)
+        // Preserve scroll position only if the user has scrolled up — auto
+        // scroll-to-bottom is what people expect when watching live logs.
+        let atBottom: Bool = {
+            guard let scroll = textView.enclosingScrollView else { return true }
+            let docHeight = scroll.documentView?.bounds.height ?? 0
+            let visibleBottom = scroll.contentView.bounds.origin.y + scroll.contentView.bounds.height
+            return abs(docHeight - visibleBottom) < 40
+        }()
+        textView.string = body
+        if atBottom {
+            textView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    // MARK: Settings tab
+
+    @MainActor private func buildSettingsTab(in container: NSView) {
+        let bounds = container.bounds
+
+        let title = NSTextField(labelWithString: "Settings")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        title.frame = NSRect(x: 20, y: bounds.height - 44, width: 200, height: 28)
+        title.autoresizingMask = [.minYMargin]
+        container.addSubview(title)
+
+        var y: CGFloat = bounds.height - 90
+
+        // Terminal app
+        let terminalLabel = NSTextField(labelWithString: "Open dev servers in:")
+        terminalLabel.frame = NSRect(x: 20, y: y, width: 160, height: 20)
+        terminalLabel.autoresizingMask = [.minYMargin]
+        container.addSubview(terminalLabel)
+
+        let terminalPopup = NSPopUpButton(frame: NSRect(x: 190, y: y - 4, width: 180, height: 26))
+        for terminal in TerminalApp.allCases {
+            let title = terminal.isInstalled ? terminal.displayName : "\(terminal.displayName) (not installed)"
+            terminalPopup.addItem(withTitle: title)
+            terminalPopup.lastItem?.isEnabled = terminal.isInstalled
+            terminalPopup.lastItem?.representedObject = terminal
+        }
+        let current = app?.config?.terminal ?? .terminal
+        if let idx = TerminalApp.allCases.firstIndex(of: current) {
+            terminalPopup.selectItem(at: idx)
+        }
+        terminalPopup.target = self
+        terminalPopup.action = #selector(terminalPopupChanged(_:))
+        terminalPopup.autoresizingMask = [.minYMargin]
+        container.addSubview(terminalPopup)
+        self.terminalPopup = terminalPopup
+
+        y -= 44
+
+        // Notifications
+        let notif = NSButton(checkboxWithTitle: "Show notifications when servers start, stop, or auto-restart",
+                             target: self, action: #selector(notificationsToggled))
+        notif.frame = NSRect(x: 20, y: y, width: 500, height: 22)
+        notif.state = (app?.config?.notifications ?? true) ? .on : .off
+        notif.autoresizingMask = [.minYMargin]
+        container.addSubview(notif)
+        self.notificationsCheckbox = notif
+
+        y -= 32
+
+        // Launch at login
+        let launch = NSButton(checkboxWithTitle: "Launch Harbr automatically when I log in",
+                              target: self, action: #selector(launchAtLoginToggled))
+        launch.frame = NSRect(x: 20, y: y, width: 500, height: 22)
+        launch.state = (app?.config?.launchAtLogin ?? false) ? .on : .off
+        launch.autoresizingMask = [.minYMargin]
+        container.addSubview(launch)
+        self.launchAtLoginCheckbox = launch
+
+        y -= 52
+
+        // Info row about log capture
+        let infoTitle = NSTextField(labelWithString: "Log capture")
+        infoTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        infoTitle.frame = NSRect(x: 20, y: y, width: 200, height: 20)
+        infoTitle.autoresizingMask = [.minYMargin]
+        container.addSubview(infoTitle)
+
+        y -= 24
+
+        let infoBody = NSTextField(wrappingLabelWithString: "Harbr wraps each dev server with /usr/bin/script so its output is saved to ~/.harbr/logs/<port>.log and shown in the Activity tab. Turn it off per project in the project's editor if you have something that needs an unwrapped command (rare).")
+        infoBody.font = NSFont.systemFont(ofSize: 11)
+        infoBody.textColor = .secondaryLabelColor
+        infoBody.frame = NSRect(x: 20, y: y - 40, width: bounds.width - 40, height: 60)
+        infoBody.autoresizingMask = [.minYMargin, .width]
+        container.addSubview(infoBody)
+        self.captureLogsDefaultLabel = infoBody
+
+        y -= 80
+
+        // About
+        let about = NSTextField(labelWithString: "Harbr · github.com/athayworth/Harbr")
+        about.font = NSFont.systemFont(ofSize: 10)
+        about.textColor = .tertiaryLabelColor
+        about.frame = NSRect(x: 20, y: 20, width: bounds.width - 40, height: 16)
+        about.autoresizingMask = [.maxYMargin]
+        container.addSubview(about)
+    }
+
+    @MainActor @objc private func terminalPopupChanged(_ sender: NSPopUpButton) {
+        guard let selected = sender.selectedItem?.representedObject as? TerminalApp else { return }
+        app?.config?.terminal = selected
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func notificationsToggled() {
+        let value = notificationsCheckbox?.state == .on
+        app?.config?.notifications = value
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func launchAtLoginToggled() {
+        let value = launchAtLoginCheckbox?.state == .on
+        guard let current = app?.config?.launchAtLogin, current != value else { return }
+        app?.toggleLaunchAtLogin()
+    }
+
+    // MARK: Refresh hook (called from app's poll)
+
+    @MainActor func reloadFromPoll() {
+        // Avoid touching tables for tabs that aren't on screen.
+        if currentTab == .projects { projectsTable?.reloadData() }
+        if currentTab == .activity {
+            activityProjectList?.reloadData()
+            refreshActivityText()
+        }
+    }
+
+    // MARK: Lifecycle
+
+    func windowWillClose(_ notification: Notification) {
+        activityRefreshTimer?.invalidate()
+        activityRefreshTimer = nil
+        guard !didDismiss else { return }
+        didDismiss = true
+        onDismiss?()
+    }
+
+    @MainActor func show() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
+// MARK: - Log Reader
+
+/// Reads the tail of a log file written by `script -q`, strips terminal
+/// control sequences, and returns plain text ready to render. Kept small
+/// and stateless so multiple consumers (Activity tab, future widgets) can
+/// share it without contention.
+enum LogReader {
+    /// Strip the common ANSI/VT sequences: SGR colors, cursor moves, and
+    /// the OSC clipboard/title pokes that some tools emit. We're not
+    /// trying to be a real terminal emulator — just produce something
+    /// readable in a plain NSTextView.
+    static let ansiRegex: NSRegularExpression? = {
+        // CSI sequences: ESC [ params final-byte
+        // OSC sequences: ESC ] ... BEL or ESC \\
+        let pattern = "\u{1B}\\[[0-9;?]*[a-zA-Z]|\u{1B}\\][^\u{07}\u{1B}]*[\u{07}\u{1B}]"
+        return try? NSRegularExpression(pattern: pattern)
+    }()
+
+    static func stripAnsi(_ s: String) -> String {
+        guard let regex = ansiRegex else { return s }
+        let range = NSRange(s.startIndex..., in: s)
+        return regex.stringByReplacingMatches(in: s, range: range, withTemplate: "")
+    }
+
+    /// Returns the last `lines` text lines of the file at `path`, with
+    /// ANSI sequences stripped. Reads up to `maxBytes` from the tail —
+    /// for very long-running servers the file may be many MB but we
+    /// only need the last screen's worth.
+    static func tail(path: String, lines: Int = 500, maxBytes: Int = 256 * 1024) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return ""
+        }
+        defer { try? handle.close() }
+
+        // Seek backward maxBytes from EOF, or to start of file.
+        let size = (try? handle.seekToEnd()) ?? 0
+        let readFrom = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        do { try handle.seek(toOffset: readFrom) } catch { return "" }
+        guard let data = try? handle.readToEnd() else { return "" }
+        let text = String(data: data, encoding: .utf8)
+            ?? String(decoding: data, as: UTF8.self)
+
+        let stripped = stripAnsi(text)
+        // Normalize CR-only and CRLF newlines so NSTextView doesn't show
+        // empty lines for every `\r` in a progress-bar redraw.
+        let normalized = stripped
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        let allLines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+        if allLines.count <= lines { return normalized }
+        return allLines.suffix(lines).joined(separator: "\n")
+    }
+}
+
 // MARK: - Main Application
 
 /// The main application delegate that manages the menu bar interface and server monitoring.
@@ -915,6 +1629,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var timer: Timer?
     var currentEditorWindow: ProjectEditorWindow?
     var currentScannerWindow: ProjectScannerWindow?
+    var currentMainWindow: HarbrMainWindow?
     var previousPortStates: [Int: Bool] = [:]
     var notificationsAuthorized = false
     /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
@@ -954,6 +1669,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         loadConfig()
+        Self.ensureLogsDir()
 
         // Request notification permissions
         requestNotificationPermissions()
@@ -1479,6 +2195,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 self.portStatusCache = newCache
                 self.rebuildMenu()
+                // Live-refresh the desktop window's tables so a project
+                // transitioning from stopped → running shows up there
+                // without the user having to click anything.
+                self.currentMainWindow?.reloadFromPoll()
 
                 // Schedule auto-restarts after a delay
                 if !projectsToRestart.isEmpty {
@@ -1651,6 +2371,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             menu.addItem(NSMenuItem.separator())
         }
+
+        let openWindowItem = NSMenuItem(title: "Open Harbr…", action: #selector(openMainWindow), keyEquivalent: "0")
+        openWindowItem.target = self
+        menu.addItem(openWindowItem)
 
         let scanProjectsItem = NSMenuItem(title: "Scan for Projects…", action: #selector(scanForProjects), keyEquivalent: "")
         scanProjectsItem.target = self
@@ -1940,11 +2664,47 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             command = "\(envPrefix) \(command)"
         }
 
+        // Wrap with `script -q LOG sh -c '<command>'` so the dev server's
+        // stdout/stderr lands in a log file Harbr can tail. `script`
+        // allocates a PTY for the inner command — without it, dev servers
+        // strip ANSI colors and disable progress bars when they detect
+        // their stdout isn't a terminal. Truncating each restart (no -a)
+        // keeps the file small and matches the mental model "new run,
+        // new logs."
+        if project.shouldCaptureLogs {
+            Self.ensureLogsDir()
+            let logPath = Self.logPath(forPort: project.port)
+            // Quote-escape single quotes inside the inner command using the
+            // standard '\'' trick so commands like `echo 'hi'` survive
+            // being wrapped in sh -c '...'.
+            let escapedInner = command.replacingOccurrences(of: "'", with: "'\\''")
+            let escapedLog = logPath.replacingOccurrences(of: "'", with: "'\\''")
+            command = "/usr/bin/script -q '\(escapedLog)' /bin/sh -c '\(escapedInner)'"
+        }
+
         lastSpawnAt[project.port] = Date()
         openTerminal(directory: project.directory, command: command, activate: activate)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.updateMenu()
+        }
+    }
+
+    /// Directory where per-port log files live. `~/.harbr/logs/`. Created
+    /// lazily on first spawn so we don't pollute the user's filesystem on
+    /// install.
+    static var logsDir: String {
+        NSString(string: "~/.harbr/logs").expandingTildeInPath
+    }
+
+    static func logPath(forPort port: Int) -> String {
+        (logsDir as NSString).appendingPathComponent("\(port).log")
+    }
+
+    static func ensureLogsDir() {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: logsDir) {
+            try? fm.createDirectory(atPath: logsDir, withIntermediateDirectories: true)
         }
     }
 
@@ -2275,6 +3035,21 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         currentEditorWindow?.show()
+    }
+
+    @MainActor @objc func openMainWindow() {
+        if currentMainWindow == nil {
+            currentMainWindow = HarbrMainWindow(app: self)
+            currentMainWindow?.onDismiss = { [weak self] in
+                DispatchQueue.main.async {
+                    // Defer release through the next runloop tick to flush any
+                    // pending CoreAnimation transactions before NSWindow
+                    // deallocates — same crash pattern that bit the editor.
+                    self?.currentMainWindow = nil
+                }
+            }
+        }
+        currentMainWindow?.show()
     }
 
     @MainActor @objc func scanForProjects() {
