@@ -948,6 +948,65 @@ enum MainWindowTab: String, CaseIterable {
     }
 }
 
+/// A clickable sidebar row. Hand-drawn because NSTableView in source-list
+/// style wouldn't render any rows in our setup (the table view's
+/// auto-sizing inside an NSScrollView came up empty even with explicit
+/// reloadData), and the look-and-feel we want — icon + label, accent
+/// highlight on selection, full row click target — is faster to draw
+/// directly than to fight cell-view lifecycle.
+private class SidebarTabView: NSView {
+    let tab: MainWindowTab
+    var isSelected: Bool = false { didSet { needsDisplay = true; updateColors() } }
+    var onClick: (() -> Void)?
+    private let iconView = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+
+    init(tab: MainWindowTab) {
+        self.tab = tab
+        super.init(frame: .zero)
+        iconView.image = NSImage(systemSymbolName: tab.sfSymbol, accessibilityDescription: tab.rawValue)
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+
+        label.stringValue = tab.rawValue
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 32),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 18),
+            iconView.heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8)
+        ])
+        updateColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func updateColors() {
+        iconView.contentTintColor = isSelected ? .controlAccentColor : .secondaryLabelColor
+        label.textColor = isSelected ? .labelColor : .secondaryLabelColor
+        label.font = NSFont.systemFont(ofSize: 13, weight: isSelected ? .medium : .regular)
+    }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isSelected {
+            NSColor.controlAccentColor.withAlphaComponent(0.18).set()
+            let inset = bounds.insetBy(dx: 8, dy: 2)
+            NSBezierPath(roundedRect: inset, xRadius: 6, yRadius: 6).fill()
+        }
+    }
+}
+
 /// The desktop window — a sidebar + content area surface where users can
 /// see all their projects in a sortable table, peek at recent server
 /// output, and adjust app-wide settings. The menu bar dropdown stays the
@@ -962,7 +1021,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     weak var app: HarbrApp?
     var window: NSWindow?
 
-    private var sidebar: NSTableView?
+    private var sidebarTabViews: [SidebarTabView] = []
     private var contentContainer: NSView?
     private var currentTab: MainWindowTab = .projects
 
@@ -1018,28 +1077,29 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         sidebarContainer.autoresizingMask = [.height]
         content.addSubview(sidebarContainer)
 
-        let sidebarScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
-        sidebarScroll.hasVerticalScroller = false
-        sidebarScroll.drawsBackground = false
-        sidebarScroll.borderType = .noBorder
-        sidebarScroll.autoresizingMask = [.height, .width]
-        sidebarContainer.addSubview(sidebarScroll)
+        let tabStack = NSStackView()
+        tabStack.orientation = .vertical
+        tabStack.alignment = .leading
+        tabStack.spacing = 4
+        tabStack.edgeInsets = NSEdgeInsets(top: 16, left: 0, bottom: 16, right: 0)
+        tabStack.translatesAutoresizingMaskIntoConstraints = false
+        sidebarContainer.addSubview(tabStack)
+        NSLayoutConstraint.activate([
+            tabStack.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            tabStack.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            tabStack.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor)
+        ])
 
-        let sidebar = NSTableView()
-        sidebar.headerView = nil
-        sidebar.backgroundColor = .clear
-        sidebar.style = .sourceList
-        sidebar.allowsEmptySelection = false
-        sidebar.allowsMultipleSelection = false
-        let sidebarCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("sidebar"))
-        sidebarCol.width = sidebarWidth
-        sidebar.addTableColumn(sidebarCol)
-        sidebar.dataSource = self
-        sidebar.delegate = self
-        sidebar.target = self
-        sidebar.action = #selector(sidebarClicked)
-        sidebarScroll.documentView = sidebar
-        self.sidebar = sidebar
+        for tab in MainWindowTab.allCases {
+            let view = SidebarTabView(tab: tab)
+            view.onClick = { [weak self] in self?.switchTo(tab) }
+            sidebarTabViews.append(view)
+            tabStack.addArrangedSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: tabStack.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: tabStack.trailingAnchor)
+            ])
+        }
 
         // Divider
         let divider = NSBox(frame: NSRect(x: sidebarWidth, y: 0, width: 1, height: 560))
@@ -1053,33 +1113,18 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         content.addSubview(container)
         self.contentContainer = container
 
-        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         switchTo(.projects)
     }
 
-    // MARK: Sidebar
+    // MARK: Tables (Projects + Activity project picker)
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView === sidebar { return MainWindowTab.allCases.count }
         if tableView === activityProjectList { return app?.config?.projects.count ?? 0 }
         if tableView === projectsTable { return app?.config?.projects.count ?? 0 }
         return 0
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        if tableView === sidebar {
-            let tab = MainWindowTab.allCases[row]
-            let cell = NSTableCellView()
-            let icon = NSImageView(frame: NSRect(x: 8, y: 4, width: 20, height: 20))
-            icon.image = NSImage(systemSymbolName: tab.sfSymbol, accessibilityDescription: tab.rawValue)
-            icon.contentTintColor = .secondaryLabelColor
-            cell.addSubview(icon)
-            let label = NSTextField(labelWithString: tab.rawValue)
-            label.frame = NSRect(x: 36, y: 4, width: 130, height: 20)
-            label.font = NSFont.systemFont(ofSize: 13)
-            cell.addSubview(label)
-            return cell
-        }
         if tableView === activityProjectList {
             guard let project = app?.config?.projects[safe: row] else { return nil }
             let cell = NSTableCellView()
@@ -1103,18 +1148,15 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        if tableView === sidebar { return 28 }
         if tableView === activityProjectList { return 26 }
         return 28
     }
 
-    @MainActor @objc private func sidebarClicked() {
-        guard let row = sidebar?.selectedRow, row >= 0 else { return }
-        switchTo(MainWindowTab.allCases[row])
-    }
-
     @MainActor private func switchTo(_ tab: MainWindowTab) {
         currentTab = tab
+        for view in sidebarTabViews {
+            view.isSelected = (view.tab == tab)
+        }
         // Tear down per-tab state so the Activity timer doesn't keep firing
         // while we're looking at Settings.
         activityRefreshTimer?.invalidate()
@@ -1168,14 +1210,18 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         table.doubleAction = #selector(projectsTableDoubleClicked)
         table.target = self
 
+        // Widths picked so the total (24+150+50+55+75+80+160 = 594) fits
+        // inside the 880px window's content area (~699px) with margin to
+        // spare, and Actions never gets pushed offscreen. Previously the
+        // total was 724px and Actions sat just outside the visible region.
         let columns: [(String, String, CGFloat)] = [
             ("status", "", 24),
-            ("name", "Name", 180),
-            ("port", "Port", 60),
-            ("cpu", "CPU", 70),
-            ("mem", "Memory", 90),
-            ("framework", "Type", 100),
-            ("actions", "", 200)
+            ("name", "Name", 150),
+            ("port", "Port", 50),
+            ("cpu", "CPU", 55),
+            ("mem", "Memory", 75),
+            ("framework", "Type", 80),
+            ("actions", "", 160)
         ]
         for (id, title, width) in columns {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
