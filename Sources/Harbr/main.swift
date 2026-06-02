@@ -475,6 +475,433 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - Project Scanner
+
+/// A project discovered by scanning a folder for `package.json` files. The
+/// fields mirror what the editor would prompt for, so adding a detected
+/// project is just "convert to Project + save."
+struct DetectedProject {
+    let name: String
+    let port: Int?
+    let directory: String
+    let command: String
+    let framework: String?
+}
+
+/// Walks a directory tree looking for `package.json` files and turns each
+/// one into a `DetectedProject`. The scanner is the implementation behind
+/// the onboarding flow that lets a vibe coder say "Here's where my projects
+/// live, find them" instead of typing port/directory/command for each.
+enum ProjectScanner {
+    /// Directories we never recurse into. Some (node_modules, .git, dist)
+    /// would never contain a real project; others (Pods, target, .venv)
+    /// can technically contain package.json files from tooling vendor
+    /// dirs and would produce false positives.
+    static let skipDirs: Set<String> = [
+        "node_modules", ".git", ".next", "dist", "build",
+        ".vercel", ".turbo", ".cache", "vendor", ".svelte-kit",
+        ".nuxt", ".output", "tmp", "Pods", ".gradle",
+        "venv", ".venv", "__pycache__", "target"
+    ]
+
+    /// Recursively scans `rootPath` up to `maxDepth` levels deep. Stops
+    /// descending into a directory the moment we find a package.json there
+    /// — the inner package.jsons of a monorepo are almost always workspace
+    /// packages, not separately-runnable projects.
+    static func scan(rootPath: String, maxDepth: Int = 4) -> [DetectedProject] {
+        var results: [DetectedProject] = []
+        let fm = FileManager.default
+        var stack: [(String, Int)] = [(rootPath, 0)]
+
+        while let (path, depth) = stack.popLast() {
+            let pkgPath = (path as NSString).appendingPathComponent("package.json")
+            if fm.fileExists(atPath: pkgPath) {
+                if let detected = parsePackageJson(at: pkgPath, directory: path) {
+                    results.append(detected)
+                }
+                continue
+            }
+            if depth >= maxDepth { continue }
+            guard let children = try? fm.contentsOfDirectory(atPath: path) else { continue }
+            for child in children {
+                if skipDirs.contains(child) || child.hasPrefix(".") { continue }
+                let childPath = (path as NSString).appendingPathComponent(child)
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: childPath, isDirectory: &isDir), isDir.boolValue {
+                    stack.append((childPath, depth + 1))
+                }
+            }
+        }
+        return results.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    private static func parsePackageJson(at path: String, directory: String) -> DetectedProject? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let scripts = (json["scripts"] as? [String: String]) ?? [:]
+        var scriptName: String?
+        var scriptBody: String?
+        for candidate in ["dev", "start", "serve"] {
+            if let body = scripts[candidate] {
+                scriptName = candidate
+                scriptBody = body
+                break
+            }
+        }
+        // If a package has no runnable dev script, it's almost certainly a
+        // library or a workspace child — not something a user would want
+        // to "start" from a menu bar.
+        guard let chosenName = scriptName else { return nil }
+
+        let rawName = (json["name"] as? String) ?? URL(fileURLWithPath: directory).lastPathComponent
+        let stripped = rawName.split(separator: "/").last.map(String.init) ?? rawName
+        let pretty = stripped
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+
+        var port: Int? = nil
+        var framework: String? = nil
+        if let body = scriptBody { port = extractPort(from: body) }
+
+        let deps = (json["dependencies"] as? [String: Any]) ?? [:]
+        let devDeps = (json["devDependencies"] as? [String: Any]) ?? [:]
+        let allDeps = Set(deps.keys).union(devDeps.keys)
+
+        if allDeps.contains("next") { framework = "Next.js"; if port == nil { port = 3000 } }
+        else if allDeps.contains("vite") { framework = "Vite"; if port == nil { port = 5173 } }
+        else if allDeps.contains("astro") { framework = "Astro"; if port == nil { port = 4321 } }
+        else if allDeps.contains("@sveltejs/kit") { framework = "SvelteKit"; if port == nil { port = 5173 } }
+        else if allDeps.contains("nuxt") { framework = "Nuxt"; if port == nil { port = 3000 } }
+        else if allDeps.contains("react-scripts") { framework = "CRA"; if port == nil { port = 3000 } }
+        else if allDeps.contains("remix") || allDeps.contains("@remix-run/dev") { framework = "Remix"; if port == nil { port = 3000 } }
+        else if allDeps.contains("express") { framework = "Express" }
+        else if allDeps.contains("fastify") { framework = "Fastify" }
+
+        return DetectedProject(
+            name: pretty,
+            port: port,
+            directory: directory,
+            command: "npm run \(chosenName)",
+            framework: framework
+        )
+    }
+
+    static func extractPort(from script: String) -> Int? {
+        let patterns = [#"--port[=\s]+(\d+)"#, #"\s-p[=\s]+(\d+)"#, #"\bPORT=(\d+)"#]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let nsRange = NSRange(script.startIndex..., in: script)
+            guard let match = regex.firstMatch(in: script, range: nsRange),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: script),
+                  let port = Int(script[range]) else { continue }
+            return port
+        }
+        return nil
+    }
+}
+
+/// Modal-style window that walks the user through scanning a folder and
+/// picking which detected projects to add. Designed to be the friendly
+/// first-run path so a new user doesn't need to know what a port is to
+/// get value from Harbr.
+class ProjectScannerWindow: NSObject, NSWindowDelegate {
+    var window: NSWindow?
+    private var pathField: NSTextField?
+    private var scanButton: NSButton?
+    private var statusLabel: NSTextField?
+    private var resultsStack: NSStackView?
+    private var addButton: NSButton?
+
+    private var detected: [DetectedProject] = []
+    private var checkboxes: [NSButton] = []
+    private let existingDirs: Set<String>
+    private let existingPorts: Set<Int>
+
+    var onAdd: (([Project]) -> Void)?
+    var onDismiss: (() -> Void)?
+    private var didDismiss = false
+
+    @MainActor init(existingProjects: [Project], onAdd: @escaping ([Project]) -> Void) {
+        self.existingDirs = Set(existingProjects.map { NSString(string: $0.directory).expandingTildeInPath })
+        self.existingPorts = Set(existingProjects.map { $0.port })
+        self.onAdd = onAdd
+        super.init()
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Find Projects"
+        window.center()
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 520, height: 360)
+        self.window = window
+
+        guard let content = window.contentView else { return }
+
+        let intro = NSTextField(labelWithString: "Pick a folder where your projects live. Harbr will scan it for runnable apps and let you add them with one click.")
+        intro.frame = NSRect(x: 20, y: 450, width: 540, height: 36)
+        intro.lineBreakMode = .byWordWrapping
+        intro.maximumNumberOfLines = 2
+        intro.font = NSFont.systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+        content.addSubview(intro)
+
+        let pathField = NSTextField(frame: NSRect(x: 20, y: 410, width: 410, height: 24))
+        pathField.placeholderString = "~/Projects"
+        pathField.stringValue = NSString(string: "~/Projects").expandingTildeInPath
+        pathField.bezelStyle = .roundedBezel
+        pathField.font = NSFont.systemFont(ofSize: 13)
+        content.addSubview(pathField)
+        self.pathField = pathField
+
+        let browseButton = NSButton(frame: NSRect(x: 438, y: 408, width: 60, height: 26))
+        browseButton.title = "Browse"
+        browseButton.bezelStyle = .rounded
+        browseButton.target = self
+        browseButton.action = #selector(browse)
+        content.addSubview(browseButton)
+
+        let scanButton = NSButton(frame: NSRect(x: 502, y: 408, width: 58, height: 26))
+        scanButton.title = "Scan"
+        scanButton.bezelStyle = .rounded
+        scanButton.keyEquivalent = "\r"
+        scanButton.target = self
+        scanButton.action = #selector(runScan)
+        if #available(macOS 11.0, *) { scanButton.bezelColor = .controlAccentColor }
+        content.addSubview(scanButton)
+        self.scanButton = scanButton
+
+        let statusLabel = NSTextField(labelWithString: "")
+        statusLabel.frame = NSRect(x: 20, y: 378, width: 540, height: 20)
+        statusLabel.font = NSFont.systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        content.addSubview(statusLabel)
+        self.statusLabel = statusLabel
+
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 70, width: 540, height: 300))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .lineBorder
+        scroll.drawsBackground = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let documentView = NSView()
+        documentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
+        ])
+        scroll.documentView = documentView
+        content.addSubview(scroll)
+        self.resultsStack = stack
+
+        let cancelButton = NSButton(frame: NSRect(x: 380, y: 20, width: 80, height: 32))
+        cancelButton.title = "Cancel"
+        cancelButton.bezelStyle = .rounded
+        cancelButton.keyEquivalent = "\u{1b}"
+        cancelButton.target = self
+        cancelButton.action = #selector(cancel)
+        content.addSubview(cancelButton)
+
+        let addButton = NSButton(frame: NSRect(x: 468, y: 20, width: 92, height: 32))
+        addButton.title = "Add"
+        addButton.bezelStyle = .rounded
+        addButton.target = self
+        addButton.action = #selector(addSelected)
+        addButton.isEnabled = false
+        if #available(macOS 11.0, *) { addButton.bezelColor = .controlAccentColor }
+        content.addSubview(addButton)
+        self.addButton = addButton
+    }
+
+    @MainActor @objc private func browse() {
+        guard let window = window else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            if resp == .OK, let url = panel.url {
+                self?.pathField?.stringValue = url.path
+                self?.runScan()
+            }
+        }
+    }
+
+    @MainActor @objc private func runScan() {
+        guard let path = pathField?.stringValue, !path.isEmpty else { return }
+        let expanded = NSString(string: path).expandingTildeInPath
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue else {
+            statusLabel?.stringValue = "Folder not found."
+            return
+        }
+        statusLabel?.stringValue = "Scanning…"
+        scanButton?.isEnabled = false
+        addButton?.isEnabled = false
+        let existingDirs = self.existingDirs
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let raw = ProjectScanner.scan(rootPath: expanded)
+            // Drop directories already configured so the user isn't offered
+            // a project they've already added.
+            let filtered = raw.filter { !existingDirs.contains($0.directory) }
+            DispatchQueue.main.async { [weak self] in
+                self?.presentResults(filtered, alreadyAdded: raw.count - filtered.count)
+            }
+        }
+    }
+
+    @MainActor private func presentResults(_ projects: [DetectedProject], alreadyAdded: Int) {
+        detected = projects
+        checkboxes.forEach { $0.removeFromSuperview() }
+        checkboxes.removeAll()
+        resultsStack?.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        scanButton?.isEnabled = true
+
+        if projects.isEmpty {
+            let msg: String
+            if alreadyAdded > 0 {
+                msg = "No new projects found (\(alreadyAdded) already added)."
+            } else {
+                msg = "No runnable projects found in that folder."
+            }
+            statusLabel?.stringValue = msg
+            addButton?.isEnabled = false
+            return
+        }
+
+        let suffix = alreadyAdded > 0 ? " (\(alreadyAdded) already added)" : ""
+        statusLabel?.stringValue = "Found \(projects.count) project\(projects.count == 1 ? "" : "s")\(suffix). Pick which to add."
+        addButton?.isEnabled = true
+        addButton?.title = "Add \(projects.count)"
+
+        for (idx, project) in projects.enumerated() {
+            let row = makeRow(for: project, index: idx)
+            resultsStack?.addArrangedSubview(row)
+        }
+    }
+
+    @MainActor private func makeRow(for project: DetectedProject, index: Int) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleSelection(_:)))
+        checkbox.tag = index
+        checkbox.state = .on
+        checkbox.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(checkbox)
+        checkboxes.append(checkbox)
+
+        let title = NSMutableAttributedString(
+            string: project.name,
+            attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                         .foregroundColor: NSColor.labelColor]
+        )
+        if let port = project.port {
+            title.append(NSAttributedString(
+                string: "  :\(port)",
+                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+                             .foregroundColor: NSColor.secondaryLabelColor]
+            ))
+        }
+        if let fw = project.framework {
+            title.append(NSAttributedString(
+                string: "   \(fw)",
+                attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                             .foregroundColor: NSColor.tertiaryLabelColor]
+            ))
+        }
+        let nameLabel = NSTextField(labelWithAttributedString: title)
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(nameLabel)
+
+        let pathLabel = NSTextField(labelWithString: project.directory.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+        pathLabel.font = NSFont.systemFont(ofSize: 10)
+        pathLabel.textColor = .tertiaryLabelColor
+        pathLabel.lineBreakMode = .byTruncatingMiddle
+        pathLabel.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(pathLabel)
+
+        NSLayoutConstraint.activate([
+            checkbox.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            checkbox.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            nameLabel.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 6),
+            nameLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 4),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+            pathLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            pathLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
+            pathLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            pathLabel.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -4),
+            row.widthAnchor.constraint(greaterThanOrEqualToConstant: 480)
+        ])
+        return row
+    }
+
+    @MainActor @objc private func toggleSelection(_ sender: NSButton) {
+        let count = checkboxes.filter { $0.state == .on }.count
+        addButton?.isEnabled = count > 0
+        addButton?.title = count > 0 ? "Add \(count)" : "Add"
+    }
+
+    @MainActor @objc private func addSelected() {
+        // For port collisions, prefer the detected value; bump duplicates by
+        // +1 until free so two Next.js projects don't both claim 3000 and
+        // immediately fail to start. The user can adjust later in the editor.
+        var taken = existingPorts
+        var toAdd: [Project] = []
+        for (idx, checkbox) in checkboxes.enumerated() {
+            guard checkbox.state == .on, idx < detected.count else { continue }
+            let d = detected[idx]
+            var port = d.port ?? 3000
+            while taken.contains(port) { port += 1 }
+            taken.insert(port)
+            toAdd.append(Project(
+                name: d.name,
+                port: port,
+                directory: d.directory,
+                startCommand: d.command,
+                group: nil,
+                healthCheckUrl: nil,
+                envVars: nil,
+                autoRestart: nil
+            ))
+        }
+        onAdd?(toAdd)
+        dismiss()
+    }
+
+    @MainActor @objc private func cancel() { dismiss() }
+
+    @MainActor private func dismiss() {
+        guard !didDismiss else { return }
+        didDismiss = true
+        window?.orderOut(nil)
+        onDismiss?()
+    }
+
+    func windowWillClose(_ notification: Notification) { dismiss() }
+
+    @MainActor func show() {
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 // MARK: - Main Application
 
 /// The main application delegate that manages the menu bar interface and server monitoring.
@@ -485,6 +912,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var config: Config?
     var timer: Timer?
     var currentEditorWindow: ProjectEditorWindow?
+    var currentScannerWindow: ProjectScannerWindow?
     var previousPortStates: [Int: Bool] = [:]
     var notificationsAuthorized = false
     /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
@@ -854,14 +1282,18 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pids = pidOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
         guard !pids.isEmpty else { return nil }
 
-        // Get resource usage for all PIDs in one ps call
+        // Get resource usage for all PIDs in one ps call. rss is the resident
+        // set size in KB — same number Activity Monitor labels "Real Memory"
+        // — which formats much more legibly as MB/GB than the old %mem
+        // (fraction-of-total-RAM) figure. Vibe coders parse "1.2 GB" as a
+        // problem; "3.4%" reads as fine even when it isn't.
         guard let psResult = SafeProcess.runCapturingOutput(
             launchPath: "/bin/ps",
-            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu,%mem"]
+            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu,rss"]
         ) else { return nil }
 
         var totalCpu: Double = 0
-        var totalMem: Double = 0
+        var totalMemMB: Double = 0
 
         let lines = psResult.stdout.components(separatedBy: "\n")
         for line in lines.dropFirst() { // Skip header
@@ -870,11 +1302,27 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .filter { !$0.isEmpty }
             if values.count >= 2 {
                 totalCpu += Double(values[0]) ?? 0
-                totalMem += Double(values[1]) ?? 0
+                // rss is in KB → MB; keep as Double so formatMemory can
+                // promote to GB at display time.
+                totalMemMB += (Double(values[1]) ?? 0) / 1024.0
             }
         }
 
-        return (totalCpu, totalMem)
+        return (totalCpu, totalMemMB)
+    }
+
+    /// Format an MB-valued double as "247 MB" or "1.4 GB", picking the unit
+    /// that reads cleanly without overspecifying. Used in both menu surfaces
+    /// so a hot project shows the same number on the top line and in its
+    /// submenu detail.
+    static func formatMemory(_ mb: Double) -> String {
+        if mb >= 1024 {
+            return String(format: "%.1f GB", mb / 1024.0)
+        } else if mb >= 100 {
+            return String(format: "%.0f MB", mb)
+        } else {
+            return String(format: "%.1f MB", mb)
+        }
     }
 
     func updateResourceCache() {
@@ -1085,15 +1533,54 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        guard let config = config else {
-            menu.addItem(NSMenuItem(title: "No projects configured", action: nil, keyEquivalent: ""))
-            let addItem = NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n")
+        // Empty/first-run state: lead with the scan flow since it's the
+        // fastest path from "fresh install" to "Harbr is useful," and keep
+        // the manual Add path right below for users who already know what
+        // they want or whose projects live somewhere unscannable.
+        if config == nil || (config?.projects.isEmpty ?? true) {
+            let welcome = NSMenuItem(title: "Welcome to Harbr", action: nil, keyEquivalent: "")
+            welcome.attributedTitle = NSAttributedString(
+                string: "Welcome to Harbr",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            welcome.isEnabled = false
+            menu.addItem(welcome)
+
+            let hint = NSMenuItem(title: "Add your dev servers to monitor and control them.", action: nil, keyEquivalent: "")
+            hint.attributedTitle = NSAttributedString(
+                string: "Add your dev servers to monitor and control them.",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+            hint.isEnabled = false
+            menu.addItem(hint)
+            menu.addItem(NSMenuItem.separator())
+
+            let scanItem = NSMenuItem(title: "Scan a folder for projects…", action: #selector(scanForProjects), keyEquivalent: "")
+            scanItem.target = self
+            scanItem.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Scan")
+            menu.addItem(scanItem)
+
+            let addItem = NSMenuItem(title: "Add a project manually…", action: #selector(addNewProject), keyEquivalent: "n")
             addItem.target = self
             menu.addItem(addItem)
+
             menu.addItem(NSMenuItem.separator())
             let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
             quitItem.target = self
             menu.addItem(quitItem)
+            return
+        }
+
+        guard let config = config else {
+            // Defensive — handled above, but the rest of this function
+            // assumes a non-nil config so the explicit unwrap here is what
+            // every downstream `config.` reference relies on.
             return
         }
 
@@ -1162,6 +1649,10 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             menu.addItem(NSMenuItem.separator())
         }
+
+        let scanProjectsItem = NSMenuItem(title: "Scan for Projects…", action: #selector(scanForProjects), keyEquivalent: "")
+        scanProjectsItem.target = self
+        menu.addItem(scanProjectsItem)
 
         let addProjectItem = NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n")
         addProjectItem.target = self
@@ -1257,7 +1748,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ]
             ))
             suffix.append(NSAttributedString(
-                string: String(format: "  %.0f%%", mem),
+                string: "  " + HarbrApp.formatMemory(mem),
                 attributes: [
                     .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular),
                     .foregroundColor: NSColor.secondaryLabelColor
@@ -1312,7 +1803,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let cpu = status.cpuUsage, let mem = status.memoryUsage {
                 let statsItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
                 let cpuStr = String(format: "%.1f%%", cpu)
-                let memStr = String(format: "%.1f%%", mem)
+                let memStr = HarbrApp.formatMemory(mem)
                 var statsText = "CPU \(cpuStr)   MEM \(memStr)"
 
                 // Add health status if configured
@@ -1782,6 +2273,25 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         currentEditorWindow?.show()
+    }
+
+    @MainActor @objc func scanForProjects() {
+        let existing = config?.projects ?? []
+        currentScannerWindow = ProjectScannerWindow(existingProjects: existing) { [weak self] newProjects in
+            guard let self = self, !newProjects.isEmpty else { return }
+            self.config?.projects.append(contentsOf: newProjects)
+            self.saveConfig()
+        }
+        currentScannerWindow?.onDismiss = { [weak self] in
+            // Same CoreAnimation-flush defer as addNewProject — releasing
+            // the NSWindow before pending CA transactions land has caused
+            // SIGBUS crashes in the editor flow, and the scanner uses the
+            // same window pattern.
+            DispatchQueue.main.async {
+                self?.currentScannerWindow = nil
+            }
+        }
+        currentScannerWindow?.show()
     }
 
     @MainActor @objc func editProject(_ sender: NSMenuItem) {
