@@ -948,6 +948,67 @@ enum MainWindowTab: String, CaseIterable {
     }
 }
 
+/// Tiny inline CPU sparkline. Renders the recent samples as a filled path
+/// from baseline to value, tinted by the latest sample so a hot project
+/// reads as orange/red even without looking at the number column. Drawn
+/// directly in NSView because Swift Charts would require NSHostingView and
+/// the visual is simple enough that the bridge isn't worth it.
+private class SparklineView: NSView {
+    var samples: [Double] = [] { didSet { needsDisplay = true } }
+    /// Y-axis ceiling. Pinned at 100 so two projects' sparklines are
+    /// directly comparable — auto-scaling would make a low-CPU project's
+    /// minor blip look as dramatic as a high-CPU project's spike.
+    var ceiling: Double = 100
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard samples.count > 1 else {
+            // Single sample or empty: just draw the baseline so the cell
+            // doesn't look broken before the second poll lands.
+            NSColor.separatorColor.set()
+            NSBezierPath(rect: NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1)).fill()
+            return
+        }
+
+        let stepX = bounds.width / CGFloat(samples.count - 1)
+        let latest = samples.last ?? 0
+        let tint: NSColor = latest >= 50 ? .systemRed
+                          : latest >= 20 ? .systemOrange
+                          : .secondaryLabelColor
+
+        // Fill: from baseline up to value at each sample. Translucent so
+        // overlapping sparklines (if we ever stack them) don't blot out
+        // the row underneath.
+        let fillPath = NSBezierPath()
+        fillPath.move(to: NSPoint(x: 0, y: bounds.height))
+        for (i, sample) in samples.enumerated() {
+            let x = CGFloat(i) * stepX
+            let yNorm = min(max(sample / ceiling, 0), 1)
+            let y = bounds.height - (CGFloat(yNorm) * bounds.height)
+            fillPath.line(to: NSPoint(x: x, y: y))
+        }
+        fillPath.line(to: NSPoint(x: bounds.width, y: bounds.height))
+        fillPath.close()
+        tint.withAlphaComponent(0.22).set()
+        fillPath.fill()
+
+        // Stroke: same path without the bottom closure, full opacity.
+        let strokePath = NSBezierPath()
+        for (i, sample) in samples.enumerated() {
+            let x = CGFloat(i) * stepX
+            let yNorm = min(max(sample / ceiling, 0), 1)
+            let y = bounds.height - (CGFloat(yNorm) * bounds.height)
+            if i == 0 { strokePath.move(to: NSPoint(x: x, y: y)) }
+            else { strokePath.line(to: NSPoint(x: x, y: y)) }
+        }
+        strokePath.lineWidth = 1.5
+        strokePath.lineJoinStyle = .round
+        tint.set()
+        strokePath.stroke()
+    }
+}
+
 /// A clickable sidebar row. Hand-drawn because NSTableView in source-list
 /// style wouldn't render any rows in our setup (the table view's
 /// auto-sizing inside an NSScrollView came up empty even with explicit
@@ -1230,19 +1291,19 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         table.doubleAction = #selector(projectsTableDoubleClicked)
         table.target = self
 
-        // Widths total 644px which fits in the 880px window's ~699px
+        // Widths total 684px which fits in the 880px window's ~699px
         // content area while leaving room for the per-row primary action
-        // button + an "⋯" overflow menu (Edit / Delete / Open in Finder /
-        // Open in Browser / Copy URL — everything the menu bar dropdown
-        // surfaces per project).
+        // button + ⋯ overflow menu. Sparkline goes right after CPU so a
+        // hot project's number + trend read together.
         let columns: [(String, String, CGFloat)] = [
             ("status", "", 24),
-            ("name", "Name", 150),
+            ("name", "Name", 140),
             ("port", "Port", 50),
-            ("cpu", "CPU", 55),
-            ("mem", "Memory", 75),
-            ("framework", "Type", 80),
-            ("actions", "", 210)
+            ("cpu", "CPU", 50),
+            ("trend", "Trend", 90),
+            ("mem", "Memory", 70),
+            ("framework", "Type", 70),
+            ("actions", "", 190)
         ]
         for (id, title, width) in columns {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
@@ -1285,12 +1346,18 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             cell.addSubview(label)
         case "cpu":
-            let val = (status?.isActive == true) ? (status?.cpuUsage).map { String(format: "%.1f%%", $0) } ?? "—" : "—"
+            let val = (status?.isActive == true) ? (status?.cpuUsage).map { String(format: "%.0f%%", $0) } ?? "—" : "—"
             let label = NSTextField(labelWithString: val)
-            label.frame = NSRect(x: 0, y: 4, width: 70, height: 20)
+            label.frame = NSRect(x: 0, y: 4, width: 50, height: 20)
             label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             label.textColor = .secondaryLabelColor
             cell.addSubview(label)
+        case "trend":
+            // Sparkline picks up live samples from the poll. Empty / single-
+            // sample is handled inside the view itself (draws a baseline).
+            let sparkline = SparklineView(frame: NSRect(x: 0, y: 4, width: 80, height: 20))
+            sparkline.samples = app?.cpuHistory[project.port] ?? []
+            cell.addSubview(sparkline)
         case "mem":
             let val = (status?.isActive == true) ? (status?.memoryUsage).map { HarbrApp.formatMemory($0) } ?? "—" : "—"
             let label = NSTextField(labelWithString: val)
@@ -2076,6 +2143,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Cache for port status to avoid blocking the menu on each open.
     var portStatusCache: [Int: PortStatus] = [:]
+    /// Rolling per-port CPU history for sparkline rendering. Sized for ~5
+    /// minutes at the 5s poll cadence (60 samples). When a port goes from
+    /// running → stopped → running, we keep the buffer so the sparkline
+    /// shows the transition gap, but trim it from the front to avoid
+    /// unbounded growth. Memory cost is negligible (Double × 60 × ports).
+    var cpuHistory: [Int: [Double]] = [:]
+    static let cpuHistoryLength = 60
     /// Monotonic counter incremented on every updateResourceCache call.
     /// Each background poll captures the value at start and only commits
     /// its result if it still matches at commit time — older in-flight polls
@@ -2352,6 +2426,19 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
 
                 self.portStatusCache = newCache
+                // Append a CPU sample per active project, padding with 0 for
+                // stopped ones so the sparkline reads as "went silent" rather
+                // than just freezing. Trim from the front to keep the buffer
+                // bounded — this is the only place that grows the history.
+                for project in projectsCopy {
+                    let sample = newCache[project.port]?.cpuUsage ?? 0
+                    var history = self.cpuHistory[project.port] ?? []
+                    history.append(sample)
+                    if history.count > HarbrApp.cpuHistoryLength {
+                        history.removeFirst(history.count - HarbrApp.cpuHistoryLength)
+                    }
+                    self.cpuHistory[project.port] = history
+                }
                 self.rebuildMenu()
                 // Live-refresh the desktop window's tables so a project
                 // transitioning from stopped → running shows up there
