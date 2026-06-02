@@ -1181,19 +1181,39 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         title.autoresizingMask = [.minYMargin]
         container.addSubview(title)
 
-        // Action toolbar — Start All / Stop All / Scan / Add
+        // Right-side toolbar (top): Start All, Stop All, Scan, Add
+        let toolbarY = bounds.height - 44
+        let startAll = NSButton(title: "Start All", target: app, action: #selector(HarbrApp.startAllProjects))
+        startAll.bezelStyle = .rounded
+        startAll.frame = NSRect(x: bounds.width - 440, y: toolbarY, width: 80, height: 28)
+        startAll.autoresizingMask = [.minXMargin, .minYMargin]
+        container.addSubview(startAll)
+
+        let stopAll = NSButton(title: "Stop All", target: app, action: #selector(HarbrApp.stopAllProjects))
+        stopAll.bezelStyle = .rounded
+        stopAll.frame = NSRect(x: bounds.width - 354, y: toolbarY, width: 78, height: 28)
+        stopAll.autoresizingMask = [.minXMargin, .minYMargin]
+        container.addSubview(stopAll)
+
         let scanButton = NSButton(title: "Scan Folder", target: app, action: #selector(HarbrApp.scanForProjects))
         scanButton.bezelStyle = .rounded
-        scanButton.frame = NSRect(x: bounds.width - 220, y: bounds.height - 44, width: 100, height: 28)
+        scanButton.frame = NSRect(x: bounds.width - 270, y: toolbarY, width: 100, height: 28)
         scanButton.autoresizingMask = [.minXMargin, .minYMargin]
         container.addSubview(scanButton)
 
         let addButton = NSButton(title: "Add Project", target: app, action: #selector(HarbrApp.addNewProject))
         addButton.bezelStyle = .rounded
-        addButton.frame = NSRect(x: bounds.width - 116, y: bounds.height - 44, width: 96, height: 28)
+        addButton.frame = NSRect(x: bounds.width - 164, y: toolbarY, width: 96, height: 28)
         addButton.autoresizingMask = [.minXMargin, .minYMargin]
         if #available(macOS 11.0, *) { addButton.bezelColor = .controlAccentColor }
         container.addSubview(addButton)
+
+        let reloadButton = NSButton(title: "↻", target: app, action: #selector(HarbrApp.reloadConfig))
+        reloadButton.bezelStyle = .rounded
+        reloadButton.frame = NSRect(x: bounds.width - 60, y: toolbarY, width: 40, height: 28)
+        reloadButton.autoresizingMask = [.minXMargin, .minYMargin]
+        reloadButton.toolTip = "Reload config from disk"
+        container.addSubview(reloadButton)
 
         // Table
         let tableScroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: bounds.width - 40, height: bounds.height - 84))
@@ -1210,10 +1230,11 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         table.doubleAction = #selector(projectsTableDoubleClicked)
         table.target = self
 
-        // Widths picked so the total (24+150+50+55+75+80+160 = 594) fits
-        // inside the 880px window's content area (~699px) with margin to
-        // spare, and Actions never gets pushed offscreen. Previously the
-        // total was 724px and Actions sat just outside the visible region.
+        // Widths total 644px which fits in the 880px window's ~699px
+        // content area while leaving room for the per-row primary action
+        // button + an "⋯" overflow menu (Edit / Delete / Open in Finder /
+        // Open in Browser / Copy URL — everything the menu bar dropdown
+        // surfaces per project).
         let columns: [(String, String, CGFloat)] = [
             ("status", "", 24),
             ("name", "Name", 150),
@@ -1221,7 +1242,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             ("cpu", "CPU", 55),
             ("mem", "Memory", 75),
             ("framework", "Type", 80),
-            ("actions", "", 160)
+            ("actions", "", 210)
         ]
         for (id, title, width) in columns {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
@@ -1310,7 +1331,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             primary.bezelStyle = .rounded
             primary.controlSize = .small
             primary.tag = row
-            primary.frame = NSRect(x: 0, y: 4, width: 76, height: 22)
+            primary.frame = NSRect(x: 0, y: 4, width: 70, height: 22)
             cell.addSubview(primary)
 
             if active {
@@ -1318,9 +1339,37 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
                 stop.bezelStyle = .rounded
                 stop.controlSize = .small
                 stop.tag = row
-                stop.frame = NSRect(x: 84, y: 4, width: 60, height: 22)
+                stop.frame = NSRect(x: 76, y: 4, width: 56, height: 22)
                 cell.addSubview(stop)
             }
+
+            // Overflow menu (⋯). Cheaper than crowding the column with
+            // five buttons and a more familiar Mac affordance for
+            // secondary actions.
+            let overflow = NSPopUpButton(frame: NSRect(x: active ? 138 : 76, y: 4, width: 40, height: 22), pullsDown: true)
+            overflow.bezelStyle = .rounded
+            overflow.controlSize = .small
+            overflow.addItem(withTitle: "⋯")
+            overflow.lastItem?.image = nil
+            for (title, sel) in [
+                ("Edit…", #selector(editFromTable(_:))),
+                ("Open in Finder", #selector(openFinderFromTable(_:))),
+                ("Open in Terminal", #selector(openTerminalFromTable(_:))),
+                ("Open in Browser", #selector(openBrowserFromTable(_:))),
+                ("Copy URL", #selector(copyUrlFromTable(_:))),
+                ("", nil as Selector?),  // separator placeholder
+                ("Delete…", #selector(deleteFromTable(_:)))
+            ] as [(String, Selector?)] {
+                if title.isEmpty {
+                    overflow.menu?.addItem(.separator())
+                    continue
+                }
+                let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+                item.target = self
+                item.representedObject = row
+                overflow.menu?.addItem(item)
+            }
+            cell.addSubview(overflow)
         default:
             break
         }
@@ -1357,6 +1406,50 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     @MainActor @objc private func restartFromTable(_ sender: NSButton) {
         guard let project = app?.config?.projects[safe: sender.tag] else { return }
         app?.restartProjectDirectly(project)
+    }
+
+    private func projectForMenuItem(_ sender: NSMenuItem) -> Project? {
+        guard let row = sender.representedObject as? Int else { return nil }
+        return app?.config?.projects[safe: row]
+    }
+
+    @MainActor @objc private func editFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        // Drive the existing editor flow through HarbrApp so config-save
+        // and CoreAnimation-flush teardown still happen the same way they
+        // do when the editor is opened from the menu.
+        let proxyMenuItem = NSMenuItem()
+        proxyMenuItem.representedObject = project
+        app?.editProject(proxyMenuItem)
+    }
+
+    @MainActor @objc private func deleteFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        let proxyMenuItem = NSMenuItem()
+        proxyMenuItem.representedObject = project
+        app?.deleteProject(proxyMenuItem)
+    }
+
+    @MainActor @objc private func openFinderFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: project.directory))
+    }
+
+    @MainActor @objc private func openTerminalFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        app?.openTerminal(directory: project.directory)
+    }
+
+    @MainActor @objc private func openBrowserFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender),
+              let url = URL(string: "http://localhost:\(project.port)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @MainActor @objc private func copyUrlFromTable(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("http://localhost:\(project.port)", forType: .string)
     }
 
     // MARK: Activity tab
@@ -1834,11 +1927,30 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return string.replacingOccurrences(of: "'", with: "'\\''")
     }
 
+    /// Escapes a string for embedding inside an AppleScript double-quoted
+    /// literal. AppleScript treats `\` as an escape character and rejects
+    /// unknown escape sequences with "Expected '\"' but found unknown token"
+    /// — exactly what happened when the script -q wrapper introduced `'\''`
+    /// (sh-quoting) into a command field that was being pasted bare into
+    /// `do script "..."`. Always apply this LAST, after any sh-level
+    /// escaping, since this is what AppleScript sees.
+    private func appleScriptEscape(_ string: String) -> String {
+        return string
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
     /// Opens a terminal window in the specified directory, optionally running a command.
     @MainActor func openTerminal(directory: String, command: String? = nil, activate: Bool = true) {
         let terminal = config?.terminal ?? .terminal
-        let safeDirectory = shellEscape(directory)
-        let safeCommand = command.map { shellEscape($0) }
+        // Directory goes inside `cd '...'` in the template, so it needs sh
+        // escaping for any `'` it might contain. Then AppleScript-escape the
+        // result so the `\` from sh-quoting doesn't choke the AppleScript
+        // parser. Command is already a bare sh expression (the user typed
+        // it; we only wrap it for log capture) — so it only needs the
+        // AppleScript escape, not another round of sh quoting.
+        let safeDirectory = appleScriptEscape(shellEscape(directory))
+        let safeCommand = command.map { appleScriptEscape($0) }
 
         let script: String
         switch terminal {
@@ -3023,14 +3135,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        // Load the agent
-        let loaded = SafeProcess.runWaitingForExit(
-            launchPath: "/bin/launchctl",
-            arguments: ["load", launchAgentPath()]
-        )
-        if !loaded {
-            Self.launchAgentLog.error("launchctl load failed for \(self.launchAgentPath(), privacy: .public) — auto-launch at login will not work until investigated")
-        }
+        // Don't `launchctl load` here. The plist has RunAtLoad=true, so a
+        // load would immediately start a SECOND copy of Harbr on top of the
+        // one the user is currently using — two menu-bar icons, two pollers
+        // racing on the same config. Writing the plist is enough; macOS
+        // picks it up on next login automatically. (Previous version spawned
+        // a duplicate icon every time the user toggled Launch-at-Login on.)
+        Self.launchAgentLog.info("Wrote LaunchAgent to \(self.launchAgentPath(), privacy: .public); will take effect at next login")
     }
 
     private func uninstallLaunchAgent() {
