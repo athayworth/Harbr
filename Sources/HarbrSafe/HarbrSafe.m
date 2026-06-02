@@ -1,6 +1,6 @@
 #import "HarbrSafe.h"
 
-NSString * const HarbrSafeErrorDomain = @"com.alexanderhayworth.harbr.HarbrSafe";
+NSString * const HarbrSafeErrorDomain = @"com.harbr.app.HarbrSafe";
 
 BOOL HarbrSafeTry(NSError **error, NS_NOESCAPE void (^block)(void)) {
     @try {
