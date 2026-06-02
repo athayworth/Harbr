@@ -692,21 +692,23 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
         scroll.hasVerticalScroller = true
         scroll.borderType = .lineBorder
         scroll.drawsBackground = false
+        // Make the document view the stack directly and pin its width to the
+        // scroll view's clip view. The previous wrapper-view layout had no
+        // width constraint on the wrapper, so the stack auto-compressed
+        // horizontally and every row collapsed to its minimum width — the
+        // checkbox + a sliver of label text overlapping at the bottom-left.
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 4
+        stack.spacing = 6
         stack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        let documentView = NSView()
-        documentView.addSubview(stack)
+        scroll.documentView = stack
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
         ])
-        scroll.documentView = documentView
         content.addSubview(scroll)
         self.resultsStack = stack
 
@@ -797,14 +799,9 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
     }
 
     @MainActor private func makeRow(for project: DetectedProject, index: Int) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
         let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleSelection(_:)))
         checkbox.tag = index
         checkbox.state = .on
-        checkbox.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(checkbox)
         checkboxes.append(checkbox)
 
         let title = NSMutableAttributedString(
@@ -827,28 +824,33 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
             ))
         }
         let nameLabel = NSTextField(labelWithAttributedString: title)
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(nameLabel)
+        nameLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let pathLabel = NSTextField(labelWithString: project.directory.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+        // Show ~ for the user's home; otherwise show the full path (relevant
+        // for projects on external drives like /Volumes/...). Truncate
+        // middle so the project's leaf folder stays readable.
+        let displayPath = project.directory.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        let pathLabel = NSTextField(labelWithString: displayPath)
         pathLabel.font = NSFont.systemFont(ofSize: 10)
         pathLabel.textColor = .tertiaryLabelColor
         pathLabel.lineBreakMode = .byTruncatingMiddle
-        pathLabel.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(pathLabel)
+        pathLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        pathLabel.cell?.truncatesLastVisibleLine = true
 
-        NSLayoutConstraint.activate([
-            checkbox.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            checkbox.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            nameLabel.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 6),
-            nameLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 4),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
-            pathLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            pathLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
-            pathLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            pathLabel.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -4),
-            row.widthAnchor.constraint(greaterThanOrEqualToConstant: 480)
-        ])
+        // Each row is now itself a stack: name+path on the right, checkbox
+        // on the left. Stack views derive a real intrinsic size from their
+        // arranged subviews, which is what the previous hand-rolled
+        // constraint layout was missing — and which is why the rows all
+        // collapsed in your screenshot.
+        let textStack = NSStackView(views: [nameLabel, pathLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 1
+
+        let row = NSStackView(views: [checkbox, textStack])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
         return row
     }
 
