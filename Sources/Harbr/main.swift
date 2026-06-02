@@ -746,9 +746,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func getResourceUsage(for port: Int) -> (cpu: Double, mem: Double)? {
         // Get PIDs for the port. SafeProcess returns nil on launch failure
         // or ObjC exception (e.g. fork() failing under memory pressure).
+        // Flags: -n (no DNS), -P (no port-name lookup), -b (avoid blocking
+        // kernel calls), -w (suppress -b warnings). Without these, lsof can
+        // hang for tens of seconds when launched from inside a GUI app
+        // because every getaddrinfo/service lookup goes through a cold
+        // resolver — the polling loop here calls this on every active port
+        // every 5s, so any per-call latency multiplies fast. Shorter timeout
+        // since a healthy lsof returns in <100ms.
         guard let pidResult = SafeProcess.runCapturingOutput(
             launchPath: "/usr/sbin/lsof",
-            arguments: ["-t", "-i", ":\(port)"]
+            arguments: ["-nP", "-b", "-w", "-t", "-i", ":\(port)"],
+            timeout: 3
         ) else { return nil }
 
         let pidOutput = pidResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1275,10 +1283,19 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // userInitiated:false so this kill doesn't get treated as the user
         // stopping the project (which would suppress the very restart we want).
         if isPortActive(project.port) {
-            stopProjectByPort(project.port, userInitiated: false) { [weak self] in
-                // Completion already fires after stopProjectByPort's built-in
-                // 0.5s grace; spawn the new terminal immediately from there.
-                self?.openProjectTerminal(project)
+            stopProjectByPort(project.port, userInitiated: false) { [weak self] portFreed in
+                guard let self = self else { return }
+                if portFreed {
+                    self.openProjectTerminal(project)
+                } else {
+                    // Don't spawn a Terminal we know will EADDRINUSE. The
+                    // user needs to investigate the stuck listener before
+                    // we'll retry.
+                    self.sendNotification(
+                        title: "Couldn't start \(project.name)",
+                        body: "Port \(project.port) is still in use — previous process didn't release it."
+                    )
+                }
             }
         } else {
             openProjectTerminal(project)
@@ -1312,7 +1329,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor func stopProjectByPort(
         _ port: Int,
         userInitiated: Bool = true,
-        completion: (() -> Void)? = nil
+        completion: ((Bool) -> Void)? = nil
     ) {
         if userInitiated {
             userStoppedPorts.insert(port)
@@ -1336,38 +1353,81 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // subprocesses are fast (~tens of ms each), keeping them off main
         // means clicks like Stop / Restart never block the menu bar.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            defer {
-                // 0.5s grace lets the OS fully reap the killed process and
-                // release the port before the next poll re-reads state, and
-                // before any chained start (via completion) tries to bind.
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    self?.updateMenu()
-                    completion?()
+            // lsof flags: -n / -P avoid DNS + service-name lookups,
+            // -b / -w avoid blocking kernel calls. Without these, lsof
+            // routinely timed out at 10s when launched from inside Harbr,
+            // which made Restart silently no-op: the kill never got any
+            // PIDs, but the completion fired anyway and Restart "succeeded"
+            // while the original server kept running.
+            let lsof = SafeProcess.runCapturingOutput(
+                launchPath: "/usr/sbin/lsof",
+                arguments: ["-nP", "-b", "-w", "-t", "-i", ":\(port)", "-sTCP:LISTEN"],
+                timeout: 3
+            )
+
+            if let result = lsof {
+                let pids = result.stdout
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .components(separatedBy: "\n")
+                    .filter { !$0.isEmpty }
+
+                for pid in pids {
+                    // First kill child processes of this PID
+                    SafeProcess.runWaitingForExit(
+                        launchPath: "/usr/bin/pkill",
+                        arguments: ["-9", "-P", pid]
+                    )
+                    // Then kill the process itself
+                    SafeProcess.runWaitingForExit(
+                        launchPath: "/bin/kill",
+                        arguments: ["-9", pid]
+                    )
                 }
             }
 
-            guard let result = SafeProcess.runCapturingOutput(
-                launchPath: "/usr/sbin/lsof",
-                arguments: ["-t", "-i", ":\(port)", "-sTCP:LISTEN"]
-            ) else { return }
+            // Verify the port is actually free before reporting success.
+            // The native socket check can't hang, so this is the safe
+            // source of truth even when lsof fails or the kill subprocesses
+            // don't take. Poll up to 3s @100ms so a slow OS reap (the old
+            // 0.5s grace) is still covered.
+            var portFree = false
+            let deadline = Date().addingTimeInterval(3.0)
+            while Date() < deadline {
+                if !SafeProcess.isPortActive(port) {
+                    portFree = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
 
-            let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !output.isEmpty else { return }
-
-            let pids = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-
-            for pid in pids {
-                // First kill child processes of this PID
-                SafeProcess.runWaitingForExit(
-                    launchPath: "/usr/bin/pkill",
-                    arguments: ["-9", "-P", pid]
-                )
-                // Then kill the process itself
-                SafeProcess.runWaitingForExit(
-                    launchPath: "/bin/kill",
-                    arguments: ["-9", pid]
-                )
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if !portFree {
+                    // Kill didn't take — undo the optimistic UI so the
+                    // toolbar count reflects reality on the next poll, and
+                    // tell the user so they don't think Restart worked.
+                    self.portStatusCache[port] = PortStatus(
+                        isActive: true,
+                        cpuUsage: nil,
+                        memoryUsage: nil,
+                        healthStatus: nil
+                    )
+                    self.previousPortStates[port] = true
+                    // Only surface a notification for user-initiated stops.
+                    // The internal port-conflict path (startProjectDirectly
+                    // calling stop with userInitiated:false) raises its own
+                    // notification in restartProjectDirectly.
+                    if userInitiated {
+                        let name = self.config?.projects.first(where: { $0.port == port })?.name
+                            ?? "port \(port)"
+                        self.sendNotification(
+                            title: "Couldn't stop \(name)",
+                            body: "Port \(port) is still in use. The kill didn't take — check the terminal window."
+                        )
+                    }
+                }
+                self.updateMenu()
+                completion?(portFree)
             }
         }
     }
@@ -1378,13 +1438,23 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor func restartProjectDirectly(_ project: Project) {
-        // Chain start off stop's completion rather than a hardcoded 1s wait.
-        // stopProjectByPort dispatches kills to a background queue and fires
-        // completion after a 0.5s grace, so we're guaranteed the kill
-        // subprocesses have actually exited before we try to spawn the new
-        // terminal — previously the 1s timer could race with a slow kill.
-        stopProjectByPort(project.port) { [weak self] in
-            self?.startProjectDirectly(project)
+        // Chain start off stop's completion. Completion now reports whether
+        // the port is actually free (verified via native socket check, not
+        // just "we issued a kill"), so we don't recursively spawn a Terminal
+        // that will EADDRINUSE while the original process keeps running.
+        // The previous version fired completion unconditionally — when
+        // lsof timed out, the kill silently no-op'd and Restart appeared
+        // to succeed while the server kept running uninterrupted.
+        stopProjectByPort(project.port) { [weak self] portFreed in
+            guard let self = self else { return }
+            if portFreed {
+                self.startProjectDirectly(project)
+            } else {
+                self.sendNotification(
+                    title: "Couldn't restart \(project.name)",
+                    body: "Port \(project.port) is still in use — kill didn't take."
+                )
+            }
         }
     }
 
