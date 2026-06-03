@@ -1335,10 +1335,15 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             let dot = NSImageView(frame: NSRect(x: 4, y: 6, width: 14, height: 14))
             let active = status?.isActive ?? false
             let unhealthy = active && status?.healthStatus == false
-            dot.image = NSImage(systemSymbolName: active ? "circle.fill" : "circle",
-                                accessibilityDescription: active ? "Running" : "Stopped")
+            let starting = !active && (app?.isStarting(port: project.port) ?? false)
+            let symbol: String = active ? "circle.fill"
+                              : starting ? "circle.dotted"
+                              : "circle"
+            dot.image = NSImage(systemSymbolName: symbol,
+                                accessibilityDescription: starting ? "Starting" : (active ? "Running" : "Stopped"))
             dot.contentTintColor = unhealthy ? .systemYellow
                                   : active ? .systemGreen
+                                  : starting ? .controlAccentColor
                                   : .tertiaryLabelColor
             cell.addSubview(dot)
         case "name":
@@ -2719,9 +2724,22 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Menu is already assigned to statusItem, no need to reassign
     }
 
+    /// True when a spawn fired within the supervised window but the port
+    /// hasn't bound yet. Used by the menu and the desktop window to render
+    /// a "Starting…" state instead of plain Stopped, so users with slow
+    /// boots (Turborepo monorepos, Docker stacks, Supabase) don't see
+    /// "nothing happened" after clicking Start.
+    @MainActor func isStarting(port: Int) -> Bool {
+        guard let spawn = lastSpawnAt[port] else { return false }
+        let elapsed = Date().timeIntervalSince(spawn)
+        guard elapsed <= HarbrApp.SUPERVISED_WINDOW else { return false }
+        return !(portStatusCache[port]?.isActive ?? false)
+    }
+
     @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
         let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil)
         let title = "\(project.name)  :\(project.port)"
+        let starting = isStarting(port: project.port)
 
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
 
@@ -2768,6 +2786,25 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let combined = NSMutableAttributedString(attributedString: primary)
             combined.append(suffix)
             item.attributedTitle = combined
+        } else if starting {
+            // Mirror the CPU/MEM suffix pattern for slow-boot feedback.
+            let primary = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            let suffix = NSAttributedString(
+                string: "   ·   Starting…",
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.controlAccentColor
+                ]
+            )
+            let combined = NSMutableAttributedString(attributedString: primary)
+            combined.append(suffix)
+            item.attributedTitle = combined
         }
 
         // Use SF Symbols for status
@@ -2788,6 +2825,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 statusSymbol = "circle.fill"
                 statusDescription = "Running"
             }
+        } else if starting {
+            // Spawn fired inside the supervised window but the port hasn't
+            // come up yet. Closes the "I clicked Start and nothing happened"
+            // gap for slow-boot stacks (Turborepo, Docker, Supabase init).
+            statusColor = .controlAccentColor
+            statusSymbol = "circle.dotted"
+            statusDescription = "Starting"
         } else {
             statusColor = .secondaryLabelColor
             statusSymbol = "circle"
