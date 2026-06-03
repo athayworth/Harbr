@@ -1130,11 +1130,17 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
         guard let content = window.contentView else { return }
 
-        // Sidebar
+        // Sidebar. Use NSVisualEffectView with the system .sidebar material
+        // so it picks up the correct vibrancy + auto-adapts to light/dark
+        // mode. The previous NSView + layer.backgroundColor approach
+        // captured NSColor.controlBackgroundColor as a CGColor at init time,
+        // which doesn't track appearance changes — switching the Mac to
+        // dark mode left the sidebar stuck white.
         let sidebarWidth: CGFloat = 180
-        let sidebarContainer = NSView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
-        sidebarContainer.wantsLayer = true
-        sidebarContainer.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        let sidebarContainer = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
+        sidebarContainer.material = .sidebar
+        sidebarContainer.blendingMode = .behindWindow
+        sidebarContainer.state = .active
         sidebarContainer.autoresizingMask = [.height]
         content.addSubview(sidebarContainer)
 
