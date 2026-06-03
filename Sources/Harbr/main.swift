@@ -1573,9 +1573,17 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         let textView = NSTextView()
         textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         textView.isEditable = false
+        // Make logs selectable + copyable. Without isSelectable, users see
+        // an error in the log and can't grab it to paste into Google or a
+        // bug report — exactly the moment they most want to copy text.
+        textView.isSelectable = true
         textView.isRichText = false
         textView.backgroundColor = NSColor(white: 0.10, alpha: 1.0)
         textView.textColor = NSColor(white: 0.92, alpha: 1.0)
+        textView.selectedTextAttributes = [
+            .backgroundColor: NSColor.controlAccentColor.withAlphaComponent(0.5),
+            .foregroundColor: NSColor.white
+        ]
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
@@ -1694,7 +1702,16 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         container.addSubview(launch)
         self.launchAtLoginCheckbox = launch
 
-        y -= 52
+        y -= 18
+
+        let launchHint = NSTextField(labelWithString: "Takes effect at your next login.")
+        launchHint.font = NSFont.systemFont(ofSize: 10)
+        launchHint.textColor = .tertiaryLabelColor
+        launchHint.frame = NSRect(x: 40, y: y, width: 400, height: 16)
+        launchHint.autoresizingMask = [.minYMargin]
+        container.addSubview(launchHint)
+
+        y -= 34
 
         // Info row about log capture
         let infoTitle = NSTextField(labelWithString: "Log capture")
@@ -1752,6 +1769,10 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             refreshActivityText()
         }
     }
+
+    /// Public entry point so the ⌘, menu item can open the window directly
+    /// to Settings instead of whatever tab was last viewed.
+    @MainActor func switchToSettings() { switchTo(.settings) }
 
     // MARK: Lifecycle
 
@@ -1882,6 +1903,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         loadConfig()
         Self.ensureLogsDir()
+        buildAppMainMenu()
 
         // Request notification permissions
         requestNotificationPermissions()
@@ -2006,11 +2028,15 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// — exactly what happened when the script -q wrapper introduced `'\''`
     /// (sh-quoting) into a command field that was being pasted bare into
     /// `do script "..."`. Always apply this LAST, after any sh-level
-    /// escaping, since this is what AppleScript sees.
+    /// escaping, since this is what AppleScript sees. Newlines and CRs also
+    /// break the parser if a user pastes a multi-line value into a path or
+    /// command field — they get escaped to AppleScript's `\n` / `\r`.
     private func appleScriptEscape(_ string: String) -> String {
         return string
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
     }
 
     /// Opens a terminal window in the specified directory, optionally running a command.
@@ -2544,6 +2570,14 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(addItem)
 
             menu.addItem(NSMenuItem.separator())
+            // Make the desktop window discoverable from day one. Without
+            // this hint, new users tend to think the dropdown is the whole
+            // app and never find Activity / Settings.
+            let openWindowItem = NSMenuItem(title: "Open Harbr Window", action: #selector(openMainWindow), keyEquivalent: "0")
+            openWindowItem.target = self
+            openWindowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: "Open Window")
+            menu.addItem(openWindowItem)
+            menu.addItem(NSMenuItem.separator())
             let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
             quitItem.target = self
             menu.addItem(quitItem)
@@ -2922,8 +2956,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // their stdout isn't a terminal. Truncating each restart (no -a)
         // keeps the file small and matches the mental model "new run,
         // new logs."
-        if project.shouldCaptureLogs {
-            Self.ensureLogsDir()
+        // Three independent preconditions for wrapping: the user opted in,
+        // /usr/bin/script exists (skipped on minimal installs / odd
+        // environments), and the logs dir is writable. If any fail we run
+        // bare — the Activity tab will show its "capture is off" message,
+        // but Start/Restart keep working.
+        if project.shouldCaptureLogs && Self.canCaptureLogs() {
             let logPath = Self.logPath(forPort: project.port)
             // Quote-escape single quotes inside the inner command using the
             // standard '\'' trick so commands like `echo 'hi'` survive
@@ -2957,6 +2995,23 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !fm.fileExists(atPath: logsDir) {
             try? fm.createDirectory(atPath: logsDir, withIntermediateDirectories: true)
         }
+    }
+
+    /// True if log capture should be attempted. Caches the result for the
+    /// app's lifetime since /usr/bin/script's presence and the home dir's
+    /// writability don't change at runtime. Without this, projects with
+    /// captureLogs=true would silently fail-to-start on minimal macOS
+    /// installs and the user would see a cryptic AppleScript error.
+    private static var _canCaptureLogsCache: Bool?
+    static func canCaptureLogs() -> Bool {
+        if let cached = _canCaptureLogsCache { return cached }
+        let fm = FileManager.default
+        let scriptExists = fm.fileExists(atPath: "/usr/bin/script")
+        ensureLogsDir()
+        let dirOK = fm.fileExists(atPath: logsDir) && fm.isWritableFile(atPath: logsDir)
+        let result = scriptExists && dirOK
+        _canCaptureLogsCache = result
+        return result
     }
 
     @MainActor @objc func stopProject(_ sender: NSMenuItem) {
@@ -3287,6 +3342,100 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentEditorWindow?.show()
     }
 
+    /// Install a standard NSApp menu bar so the desktop window gets the
+    /// keyboard shortcuts users expect: ⌘W close, ⌘M minimize, ⌘Q quit,
+    /// ⌘, settings, ⌘N add project — plus the Edit menu so the Activity
+    /// tab's logs can be copied via ⌘C from selection. For LSUIElement
+    /// apps like Harbr this menu only shows when a window is focused,
+    /// so it doesn't intrude on the menu-bar-only workflow.
+    @MainActor private func buildAppMainMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenuItem.submenu = appMenu
+        appMenu.addItem(NSMenuItem(title: "About Harbr",
+                                    action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                                    keyEquivalent: ""))
+        appMenu.addItem(.separator())
+        let prefsItem = NSMenuItem(title: "Settings…",
+                                    action: #selector(openSettingsWindow),
+                                    keyEquivalent: ",")
+        prefsItem.target = self
+        appMenu.addItem(prefsItem)
+        appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem(title: "Hide Harbr",
+                                    action: #selector(NSApplication.hide(_:)),
+                                    keyEquivalent: "h"))
+        appMenu.addItem(NSMenuItem(title: "Quit Harbr",
+                                    action: #selector(NSApplication.terminate(_:)),
+                                    keyEquivalent: "q"))
+        mainMenu.addItem(appMenuItem)
+
+        // File menu
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        fileMenuItem.submenu = fileMenu
+        let newItem = NSMenuItem(title: "Add Project…",
+                                  action: #selector(addNewProject),
+                                  keyEquivalent: "n")
+        newItem.target = self
+        fileMenu.addItem(newItem)
+        let scanItem = NSMenuItem(title: "Scan for Projects…",
+                                   action: #selector(scanForProjects),
+                                   keyEquivalent: "")
+        scanItem.target = self
+        fileMenu.addItem(scanItem)
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(NSMenuItem(title: "Close Window",
+                                     action: #selector(NSWindow.performClose(_:)),
+                                     keyEquivalent: "w"))
+        mainMenu.addItem(fileMenuItem)
+
+        // Edit menu — standard responder-chain selectors so it picks up the
+        // first responder (NSTextField, NSTextView) without manual wiring.
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenuItem.submenu = editMenu
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        mainMenu.addItem(editMenuItem)
+
+        // View menu — sets up Harbr's own commands.
+        let viewMenuItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        viewMenuItem.submenu = viewMenu
+        let openWindow = NSMenuItem(title: "Open Harbr Window",
+                                     action: #selector(openMainWindow),
+                                     keyEquivalent: "0")
+        openWindow.target = self
+        viewMenu.addItem(openWindow)
+        mainMenu.addItem(viewMenuItem)
+
+        // Window menu
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenuItem.submenu = windowMenu
+        windowMenu.addItem(NSMenuItem(title: "Minimize",
+                                       action: #selector(NSWindow.performMiniaturize(_:)),
+                                       keyEquivalent: "m"))
+        windowMenu.addItem(NSMenuItem(title: "Zoom",
+                                       action: #selector(NSWindow.performZoom(_:)),
+                                       keyEquivalent: ""))
+        mainMenu.addItem(windowMenuItem)
+        NSApp.windowsMenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    @MainActor @objc func openSettingsWindow() {
+        openMainWindow()
+        currentMainWindow?.switchToSettings()
+    }
+
     @MainActor @objc func openMainWindow() {
         if currentMainWindow == nil {
             currentMainWindow = HarbrMainWindow(app: self)
@@ -3359,6 +3508,16 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // silently fails when the user has renamed the project after the
             // menu was built (the menu item holds the old Project value).
             config?.projects.removeAll { $0.port == project.port }
+            // Drop the dead port's accumulated state so a future project
+            // reusing the same port doesn't inherit a sparkline + status
+            // cache from the deleted one.
+            cpuHistory.removeValue(forKey: project.port)
+            portStatusCache.removeValue(forKey: project.port)
+            previousPortStates.removeValue(forKey: project.port)
+            // Delete the per-port log file — keeping it around would let
+            // the Activity tab show stale output from the deleted project
+            // if the port is later reused.
+            try? FileManager.default.removeItem(atPath: HarbrApp.logPath(forPort: project.port))
             saveConfig()
         }
     }
