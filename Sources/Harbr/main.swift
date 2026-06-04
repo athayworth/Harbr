@@ -1088,6 +1088,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
     // Projects tab
     private var projectsTable: NSTableView?
+    private var healthBanner: NSTextField?
 
     // Activity tab
     private var activityProjectList: NSTableView?
@@ -1248,6 +1249,23 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         title.autoresizingMask = [.minYMargin]
         container.addSubview(title)
 
+        // System health banner — sits between the title and the table.
+        // Hidden visually when there's nothing to say (low system pressure
+        // and no attention-grabbing verdicts), shown with a tinted bar
+        // when something warrants surfacing.
+        let banner = NSTextField(labelWithString: "")
+        banner.frame = NSRect(x: 20, y: bounds.height - 78, width: bounds.width - 40, height: 24)
+        banner.autoresizingMask = [.width, .minYMargin]
+        banner.maximumNumberOfLines = 1
+        banner.cell?.truncatesLastVisibleLine = true
+        banner.font = NSFont.systemFont(ofSize: 12)
+        banner.drawsBackground = true
+        banner.wantsLayer = true
+        banner.layer?.cornerRadius = 6
+        container.addSubview(banner)
+        self.healthBanner = banner
+        refreshHealthBanner()
+
         // Right-side toolbar (top): Start All, Stop All, Scan, Add
         let toolbarY = bounds.height - 44
         let startAll = NSButton(title: "Start All", target: app, action: #selector(HarbrApp.startAllProjects))
@@ -1282,8 +1300,9 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         reloadButton.toolTip = "Reload config from disk"
         container.addSubview(reloadButton)
 
-        // Table
-        let tableScroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: bounds.width - 40, height: bounds.height - 84))
+        // Table — shifted down by the banner's 30px footprint so it
+        // doesn't overlap when the banner is visible.
+        let tableScroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: bounds.width - 40, height: bounds.height - 114))
         tableScroll.hasVerticalScroller = true
         tableScroll.borderType = .lineBorder
         tableScroll.autoresizingMask = [.width, .height]
@@ -1347,7 +1366,25 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
                                   : .tertiaryLabelColor
             cell.addSubview(dot)
         case "name":
-            let label = NSTextField(labelWithString: project.name)
+            // Inline verdict suffix — appears after the name when the
+            // engine has something to say (idle, climbing, hot CPU, etc.).
+            // Tinted by severity so attention-grabbing ones stand out in
+            // peripheral vision without needing a separate column.
+            let verdict = app?.verdict(for: project)
+            let attributed = NSMutableAttributedString(
+                string: project.name,
+                attributes: [.font: NSFont.systemFont(ofSize: 13),
+                             .foregroundColor: NSColor.labelColor]
+            )
+            if let v = verdict {
+                let tint: NSColor = v.isAttention ? .systemOrange : .secondaryLabelColor
+                attributed.append(NSAttributedString(
+                    string: "  ·  " + v.displayText,
+                    attributes: [.font: NSFont.systemFont(ofSize: 11),
+                                 .foregroundColor: tint]
+                ))
+            }
+            let label = NSTextField(labelWithAttributedString: attributed)
             label.frame = NSRect(x: 0, y: 4, width: 200, height: 20)
             label.lineBreakMode = .byTruncatingTail
             cell.addSubview(label)
@@ -1366,8 +1403,10 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         case "trend":
             // Sparkline picks up live samples from the poll. Empty / single-
             // sample is handled inside the view itself (draws a baseline).
+            // History buffer is 1h long; the trend column only wants the
+            // last 5 min so each pixel covers a meaningful slice of time.
             let sparkline = SparklineView(frame: NSRect(x: 0, y: 4, width: 80, height: 20))
-            sparkline.samples = app?.cpuHistory[project.port] ?? []
+            sparkline.samples = Array((app?.cpuHistory[project.port] ?? []).suffix(60))
             cell.addSubview(sparkline)
         case "mem":
             let val = (status?.isActive == true) ? (status?.memoryUsage).map { HarbrApp.formatMemory($0) } ?? "—" : "—"
@@ -1768,11 +1807,67 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
     @MainActor func reloadFromPoll() {
         // Avoid touching tables for tabs that aren't on screen.
-        if currentTab == .projects { projectsTable?.reloadData() }
+        if currentTab == .projects {
+            projectsTable?.reloadData()
+            refreshHealthBanner()
+        }
         if currentTab == .activity {
             activityProjectList?.reloadData()
             refreshActivityText()
         }
+    }
+
+    /// Compute and render the system health banner from current state.
+    /// Reads memory pressure once per refresh — at ~5s poll cadence this
+    /// is well under the cost of a single lsof call.
+    @MainActor private func refreshHealthBanner() {
+        guard let banner = healthBanner, let app = app else { return }
+
+        let pressure = HarbrApp.systemMemoryPressureLevel()
+        let totalMemMB = app.totalActiveMemoryMB()
+        let activeCount = app.activeProjectCount()
+        let projects = app.config?.projects ?? []
+
+        // Collect attention-worthy verdicts (skip neutral cases like
+        // "compiling" — the user knows they just clicked Start).
+        let attention = projects.compactMap { project -> (Project, HarbrApp.ProjectVerdict)? in
+            guard let v = app.verdict(for: project), v.isAttention else { return nil }
+            return (project, v)
+        }
+
+        let memText = totalMemMB >= 1024
+            ? String(format: "%.1f GB", totalMemMB / 1024)
+            : "\(Int(totalMemMB)) MB"
+        let projectsText = activeCount == 1 ? "1 project" : "\(activeCount) projects"
+        let baseLine = activeCount == 0
+            ? "No dev servers running."
+            : "Localhost: \(memText) across \(projectsText)."
+
+        // Three tiers of severity drive tint + headline:
+        //   pressure 4 / 2 → system is squeezed, lead with that
+        //   any attention verdict → lead with the project
+        //   else → quiet baseline
+        var headline = baseLine
+        var fg: NSColor = .secondaryLabelColor
+        var bg: NSColor = NSColor.controlBackgroundColor.withAlphaComponent(0.5)
+
+        if pressure >= 2 {
+            let critical = pressure >= 4
+            fg = critical ? .systemRed : .systemOrange
+            bg = (critical ? NSColor.systemRed : NSColor.systemOrange).withAlphaComponent(0.12)
+            headline = "macOS is under memory \(critical ? "critical" : "warning") pressure. \(baseLine)"
+            if let first = attention.first {
+                headline += " Try stopping \(first.0.name)."
+            }
+        } else if let (proj, verdict) = attention.first {
+            fg = .systemOrange
+            bg = NSColor.systemOrange.withAlphaComponent(0.10)
+            headline = "\(proj.name): \(verdict.displayText). \(baseLine)"
+        }
+
+        banner.stringValue = "  " + headline + "  "
+        banner.textColor = fg
+        banner.backgroundColor = bg
     }
 
     /// Public entry point so the ⌘, menu item can open the window directly
@@ -2180,13 +2275,15 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Cache for port status to avoid blocking the menu on each open.
     var portStatusCache: [Int: PortStatus] = [:]
-    /// Rolling per-port CPU history for sparkline rendering. Sized for ~5
-    /// minutes at the 5s poll cadence (60 samples). When a port goes from
-    /// running → stopped → running, we keep the buffer so the sparkline
-    /// shows the transition gap, but trim it from the front to avoid
-    /// unbounded growth. Memory cost is negligible (Double × 60 × ports).
+    /// Rolling per-port CPU + memory history. Sized for ~1 hour at the 5s
+    /// poll cadence so the verdict engine can detect slow memory leaks and
+    /// the upcoming detail view can show a real timeline. The sparkline
+    /// only uses the trailing 60 samples (5 min) so increasing the buffer
+    /// doesn't change its visual density. Memory cost is negligible:
+    /// 720 × 2 × N projects × 8 bytes ≈ 250 KB for 20 projects.
     var cpuHistory: [Int: [Double]] = [:]
-    static let cpuHistoryLength = 60
+    var memHistory: [Int: [Double]] = [:]
+    static let historyLength = 720
     /// Monotonic counter incremented on every updateResourceCache call.
     /// Each background poll captures the value at start and only commits
     /// its result if it still matches at commit time — older in-flight polls
@@ -2463,18 +2560,25 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
 
                 self.portStatusCache = newCache
-                // Append a CPU sample per active project, padding with 0 for
-                // stopped ones so the sparkline reads as "went silent" rather
-                // than just freezing. Trim from the front to keep the buffer
-                // bounded — this is the only place that grows the history.
+                // Append CPU + memory samples per project, padding stopped
+                // ones with 0 so charts and verdicts read "went silent"
+                // rather than freezing. Trim from the front to keep both
+                // buffers bounded — this is the single growth point.
                 for project in projectsCopy {
-                    let sample = newCache[project.port]?.cpuUsage ?? 0
-                    var history = self.cpuHistory[project.port] ?? []
-                    history.append(sample)
-                    if history.count > HarbrApp.cpuHistoryLength {
-                        history.removeFirst(history.count - HarbrApp.cpuHistoryLength)
+                    let cpuSample = newCache[project.port]?.cpuUsage ?? 0
+                    let memSample = newCache[project.port]?.memoryUsage ?? 0
+                    var cpuRing = self.cpuHistory[project.port] ?? []
+                    var memRing = self.memHistory[project.port] ?? []
+                    cpuRing.append(cpuSample)
+                    memRing.append(memSample)
+                    if cpuRing.count > HarbrApp.historyLength {
+                        cpuRing.removeFirst(cpuRing.count - HarbrApp.historyLength)
                     }
-                    self.cpuHistory[project.port] = history
+                    if memRing.count > HarbrApp.historyLength {
+                        memRing.removeFirst(memRing.count - HarbrApp.historyLength)
+                    }
+                    self.cpuHistory[project.port] = cpuRing
+                    self.memHistory[project.port] = memRing
                 }
                 self.rebuildMenu()
                 // Live-refresh the desktop window's tables so a project
@@ -2722,6 +2826,143 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
         // Menu is already assigned to statusItem, no need to reassign
+    }
+
+    // MARK: - Verdict engine
+
+    /// Plain-English status interpretation for a project. Drives both the
+    /// per-row hint in the desktop window and the system-level health
+    /// banner. Verdicts surface ONLY when there's something worth saying —
+    /// a healthy project shows no verdict, the way a healthy person doesn't
+    /// need a status update. Each case carries the numbers that justify
+    /// it so the displayed text can be specific, not vague.
+    enum ProjectVerdict {
+        case compiling
+        case idleHours(Int)
+        case climbing(deltaMB: Double, overMinutes: Int)
+        case hotCPU(percent: Double)
+        case heavyMemory(memoryMB: Double)
+
+        var displayText: String {
+            switch self {
+            case .compiling: return "compiling"
+            case .idleHours(let h): return h == 1 ? "idle 1h" : "idle \(h)h"
+            case .climbing(let delta, let mins):
+                let signed = delta >= 0 ? "+\(Int(delta))" : "\(Int(delta))"
+                return "\(signed) MB in \(mins) min"
+            case .hotCPU(let pct): return "\(Int(pct))% CPU"
+            case .heavyMemory(let mem): return "\(HarbrApp.formatMemory(mem))"
+            }
+        }
+
+        /// True when the verdict represents a problem (vs. neutral activity
+        /// like "compiling"). Drives the row's tint and whether the system
+        /// banner picks it up as a suggested action.
+        var isAttention: Bool {
+            switch self {
+            case .climbing, .hotCPU, .heavyMemory, .idleHours: return true
+            case .compiling: return false
+            }
+        }
+    }
+
+    /// Returns a verdict for the project or nil if there's nothing notable
+    /// to report. Order matters: compiling beats climbing (a server starting
+    /// up uses memory legitimately), idle beats high-memory (an idle but
+    /// big-footprint server is more usefully described as idle).
+    @MainActor func verdict(for project: Project) -> ProjectVerdict? {
+        let status = portStatusCache[project.port]
+        guard status?.isActive == true else { return nil }
+
+        // Compiling: spawn within last 60s and CPU still high. Catches the
+        // Turborepo / Next first-compile window — the user just hit Start
+        // and we want to label what's happening, not flag it as "hot CPU."
+        if let spawnAt = lastSpawnAt[project.port],
+           Date().timeIntervalSince(spawnAt) < 60,
+           (status?.cpuUsage ?? 0) > 30 {
+            return .compiling
+        }
+
+        // Idle: log file hasn't been written in 1h+ AND CPU is essentially
+        // flat. The log mtime check works regardless of log format because
+        // any output (request line, HMR tick, error) touches the file.
+        // Survives Harbr restart because mtime lives on disk.
+        if let idleHours = idleHoursForPort(project.port),
+           idleHours >= 1,
+           recentAverageCpu(port: project.port) < 1.0 {
+            return .idleHours(idleHours)
+        }
+
+        // Climbing memory: compare current to median of 10 min ago. Needs
+        // enough history to mean something — wait until we have 120 samples
+        // (10 min). Threshold of 100 MB filters out noise from GC cycles.
+        if let history = memHistory[project.port], history.count >= 120 {
+            let current = history.suffix(12).reduce(0, +) / 12.0
+            let tenMinAgo = Array(history.suffix(132).prefix(12)).reduce(0, +) / 12.0
+            let delta = current - tenMinAgo
+            if delta > 100 && current > tenMinAgo * 1.3 {
+                return .climbing(deltaMB: delta, overMinutes: 10)
+            }
+        }
+
+        // Heavy memory: > 2 GB. This is the threshold where a single dev
+        // server starts noticeably contributing to system pressure on a
+        // 16 GB Mac.
+        if let mem = status?.memoryUsage, mem > 2048 {
+            return .heavyMemory(memoryMB: mem)
+        }
+
+        // Hot CPU: sustained > 60% over the last minute. Excludes the
+        // compile-window spike already handled above.
+        if recentAverageCpu(port: project.port) > 60 {
+            return .hotCPU(percent: recentAverageCpu(port: project.port))
+        }
+
+        return nil
+    }
+
+    private func idleHoursForPort(_ port: Int) -> Int? {
+        let path = HarbrApp.logPath(forPort: port)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date else { return nil }
+        let hours = Int(Date().timeIntervalSince(mtime) / 3600)
+        return hours
+    }
+
+    private func recentAverageCpu(port: Int) -> Double {
+        guard let history = cpuHistory[port], !history.isEmpty else { return 0 }
+        let last12 = history.suffix(12)  // 60 seconds at 5s cadence
+        return last12.reduce(0, +) / Double(last12.count)
+    }
+
+    /// macOS memory pressure level via sysctl: 1 = normal, 2 = warn,
+    /// 4 = critical. Read each poll so the health banner stays current.
+    /// Falls back to 1 (normal) if the read fails — better to under-warn
+    /// than to spam the banner with a stale critical reading.
+    static func systemMemoryPressureLevel() -> Int {
+        let result = SafeProcess.runCapturingOutput(
+            launchPath: "/usr/sbin/sysctl",
+            arguments: ["-n", "kern.memorystatus_vm_pressure_level"],
+            timeout: 2
+        )
+        guard let text = result?.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+              let level = Int(text) else { return 1 }
+        return level
+    }
+
+    /// Sum of memoryUsage across active projects, in MB. The "your dev
+    /// servers are using N GB" headline number.
+    @MainActor func totalActiveMemoryMB() -> Double {
+        var total: Double = 0
+        for (_, status) in portStatusCache where status.isActive {
+            total += status.memoryUsage ?? 0
+        }
+        return total
+    }
+
+    /// Count of running projects, for the "across N projects" suffix.
+    @MainActor func activeProjectCount() -> Int {
+        portStatusCache.values.filter { $0.isActive }.count
     }
 
     /// True when a spawn fired within the supervised window but the port
@@ -3556,6 +3797,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // reusing the same port doesn't inherit a sparkline + status
             // cache from the deleted one.
             cpuHistory.removeValue(forKey: project.port)
+            memHistory.removeValue(forKey: project.port)
             portStatusCache.removeValue(forKey: project.port)
             previousPortStates.removeValue(forKey: project.port)
             // Delete the per-port log file — keeping it around would let
