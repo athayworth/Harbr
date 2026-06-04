@@ -85,6 +85,18 @@ built but isn't really *offered* to anyone.
   read because long-but-bounded lines (compiler errors with full
   paths) shouldn't get cropped — only pathological single-line outputs.
 
+- [x] **Block second instance via `LSMultipleInstancesProhibited`.**
+  Added to `Resources/Info.plist` (and patched into the installed
+  `/Applications/Harbr.app/Contents/Info.plist`) on 2026-06-04. Fixes
+  the duplicate menu-bar-icon bug where a stale SMAppService login
+  item and Harbr's own LaunchAgent both fire at login and macOS
+  happily starts two copies of the same bundle. With this key,
+  macOS refuses the second launch regardless of how many login
+  mechanisms register the app — defense in depth vs. trying to
+  reconcile the two registration paths. Existing duplicate PIDs
+  must still be killed manually for the current session; this only
+  prevents recurrence at next login.
+
 - [ ] **Guard rapid open/close lifecycle of `HarbrMainWindow`.** If
   the user double-clicks "Open Harbr" or hits ⌘0 twice fast, an
   in-flight `onDismiss` callback from the first window could land
