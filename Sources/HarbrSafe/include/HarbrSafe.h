@@ -1,3 +1,11 @@
+//
+//  HarbrSafe.h
+//  Harbr
+//
+//  Copyright (c) 2025 Alexander Hayworth
+//  Licensed under the MIT License. See LICENSE file for details.
+//
+
 #import <Foundation/Foundation.h>
 
 NS_ASSUME_NONNULL_BEGIN

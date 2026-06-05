@@ -1079,6 +1079,9 @@ private class SidebarTabView: NSView {
 /// controllers and the visual design we want (sidebar selection driving
 /// the right pane) is simpler with manual view swapping.
 class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    static let frameAutosaveName = "com.harbr.app.mainWindow"
+    static let lastTabDefaultsKey = "com.harbr.app.mainWindowLastTab"
+
     weak var app: HarbrApp?
     var window: NSWindow?
 
@@ -1119,13 +1122,19 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             defer: false
         )
         window.title = "Harbr"
-        window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 720, height: 420)
         if #available(macOS 11.0, *) {
             window.titlebarAppearsTransparent = false
             window.toolbarStyle = .unified
+        }
+        // setFrameAutosaveName persists frame changes on resize/move and is
+        // paired with setFrameUsingName to restore. center() only runs when
+        // there's no saved frame yet, so the autosave wins on subsequent runs.
+        window.setFrameAutosaveName(Self.frameAutosaveName)
+        if !window.setFrameUsingName(Self.frameAutosaveName) {
+            window.center()
         }
         self.window = window
 
@@ -1181,7 +1190,9 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         content.addSubview(container)
         self.contentContainer = container
 
-        switchTo(.projects)
+        let initial = UserDefaults.standard.string(forKey: Self.lastTabDefaultsKey)
+            .flatMap(MainWindowTab.init(rawValue:)) ?? .projects
+        switchTo(initial)
     }
 
     // MARK: Tables (Projects + Activity project picker)
@@ -1409,11 +1420,21 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             sparkline.samples = Array((app?.cpuHistory[project.port] ?? []).suffix(60))
             cell.addSubview(sparkline)
         case "mem":
-            let val = (status?.isActive == true) ? (status?.memoryUsage).map { HarbrApp.formatMemory($0) } ?? "—" : "—"
+            let mem = (status?.isActive == true) ? status?.memoryUsage : nil
+            let val = mem.map { HarbrApp.formatMemory($0) } ?? "—"
             let label = NSTextField(labelWithString: val)
             label.frame = NSRect(x: 0, y: 4, width: 90, height: 20)
             label.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            label.textColor = .secondaryLabelColor
+            // 2 GB is the verdict engine's "heavy" threshold — at this point a
+            // single dev server is contributing measurable pressure on a 16 GB
+            // Mac. Tint red and explain in the tooltip so the user can see
+            // who's eating their RAM without opening Activity Monitor.
+            if let mem, mem > 2048 {
+                label.textColor = .systemRed
+                label.toolTip = "Using \(HarbrApp.formatMemory(mem)) — this project is contributing to system slowness."
+            } else {
+                label.textColor = .secondaryLabelColor
+            }
             cell.addSubview(label)
         case "framework":
             // Best-effort: re-parse package.json once per row build. Cheap
@@ -1879,6 +1900,8 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     func windowWillClose(_ notification: Notification) {
         activityRefreshTimer?.invalidate()
         activityRefreshTimer = nil
+        UserDefaults.standard.set(currentTab.rawValue, forKey: Self.lastTabDefaultsKey)
+        // The frame is auto-saved by NSWindow via setFrameAutosaveName.
         guard !didDismiss else { return }
         didDismiss = true
         onDismiss?()
@@ -1924,6 +1947,12 @@ enum LogReader {
     /// ANSI sequences stripped. Reads up to `maxBytes` from the tail —
     /// for very long-running servers the file may be many MB but we
     /// only need the last screen's worth.
+    /// Single-line byte cap. Lines longer than this are truncated with an
+    /// ellipsis marker before being handed to NSTextView. Bounded multi-KB
+    /// lines (compiler errors with full paths, JSON blobs) pass through; only
+    /// pathological output like a 10 MB minified progress bar gets cropped.
+    static let maxLineBytes = 8 * 1024
+
     static func tail(path: String, lines: Int = 500, maxBytes: Int = 256 * 1024) -> String {
         guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
             return ""
@@ -1946,8 +1975,18 @@ enum LogReader {
             .replacingOccurrences(of: "\r", with: "\n")
 
         let allLines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
-        if allLines.count <= lines { return normalized }
-        return allLines.suffix(lines).joined(separator: "\n")
+        let selected = allLines.count <= lines ? Array(allLines) : Array(allLines.suffix(lines))
+        return selected.map(capLine).joined(separator: "\n")
+    }
+
+    private static func capLine(_ line: Substring) -> String {
+        let utf8Count = line.utf8.count
+        guard utf8Count > maxLineBytes else { return String(line) }
+        // Cap by character count proportional to byte budget; cheap and avoids
+        // mid-grapheme slicing surprises that a utf8 index walk could hit.
+        let charBudget = max(1, line.count * maxLineBytes / utf8Count)
+        let head = String(line.prefix(charBudget))
+        return "\(head)… [line truncated, \(utf8Count) bytes]"
     }
 }
 
@@ -1960,6 +1999,11 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem?
     var config: Config?
     var timer: Timer?
+    /// macOS-level memory pressure source. Fires on transitions between
+    /// normal / warning / critical so we can repaint the menu bar icon
+    /// without polling.
+    var memoryPressureSource: DispatchSourceMemoryPressure?
+    var currentMemoryPressure: DispatchSource.MemoryPressureEvent = .normal
     var currentEditorWindow: ProjectEditorWindow?
     var currentScannerWindow: ProjectScannerWindow?
     var currentMainWindow: HarbrMainWindow?
@@ -1996,17 +2040,19 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "sailboat.fill", accessibilityDescription: "Harbr")
-            button.image?.isTemplate = true
-        }
+        applyMemoryPressureToStatusIcon()
+        startMemoryPressureMonitoring()
 
         loadConfig()
         Self.ensureLogsDir()
         buildAppMainMenu()
 
-        // Request notification permissions
-        requestNotificationPermissions()
+        // First-launch users get an in-app explainer before macOS surfaces
+        // the bare "Harbr would like to…" prompts; on subsequent launches we
+        // skip the banner and go straight to the notification request.
+        DispatchQueue.main.async { [weak self] in
+            self?.showFirstLaunchPermissionExplanationIfNeeded()
+        }
 
         // Create persistent menu with delegate to track open/close state
         statusMenu = NSMenu()
@@ -2022,6 +2068,76 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Update menu every 5 seconds
         timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.updateMenu()
+        }
+    }
+
+    static let didShowPermissionExplanationKey = "com.harbr.app.didShowPermissionExplanation"
+
+    @MainActor private func showFirstLaunchPermissionExplanationIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.didShowPermissionExplanationKey) else {
+            requestNotificationPermissions()
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Welcome to Harbr"
+        alert.informativeText = """
+        Harbr monitors your dev servers from the menu bar. macOS will ask for two permissions, and both are needed for the app to work end-to-end:
+
+        • Notifications — so Harbr can alert you when a server crashes or auto-restarts.
+
+        • Control of Terminal — so Harbr can launch your dev servers in a new tab when you click Start.
+
+        Granting either is reversible later in System Settings → Privacy & Security.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Continue")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        defaults.set(true, forKey: Self.didShowPermissionExplanationKey)
+        requestNotificationPermissions()
+    }
+
+    private func startMemoryPressureMonitoring() {
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let source else { return }
+            self.currentMemoryPressure = source.data
+            self.applyMemoryPressureToStatusIcon()
+        }
+        source.resume()
+        memoryPressureSource = source
+    }
+
+    /// Repaint the menu bar icon according to the current macOS memory pressure.
+    /// Normal renders as a template (adapts to menu bar appearance); warning and
+    /// critical drop the template flag and tint via palette colors so the user
+    /// notices something is wrong even with the menu closed.
+    private func applyMemoryPressureToStatusIcon() {
+        guard let button = statusItem?.button else { return }
+        guard let baseImage = NSImage(systemSymbolName: "sailboat.fill", accessibilityDescription: "Harbr") else { return }
+
+        switch currentMemoryPressure {
+        case .critical, .warning:
+            let tint: NSColor = (currentMemoryPressure == .critical) ? .systemRed : .systemOrange
+            if #available(macOS 12.0, *),
+               let tinted = baseImage.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [tint])) {
+                tinted.isTemplate = false
+                button.image = tinted
+            } else {
+                baseImage.isTemplate = true
+                button.image = baseImage
+            }
+            button.toolTip = currentMemoryPressure == .critical
+                ? "macOS memory pressure: critical — close apps or stop heavy projects."
+                : "macOS memory pressure: elevated."
+        default:
+            baseImage.isTemplate = true
+            button.image = baseImage
+            button.toolTip = nil
         }
     }
 
@@ -3723,12 +3839,16 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @MainActor @objc func openMainWindow() {
         if currentMainWindow == nil {
-            currentMainWindow = HarbrMainWindow(app: self)
-            currentMainWindow?.onDismiss = { [weak self] in
+            let window = HarbrMainWindow(app: self)
+            currentMainWindow = window
+            currentMainWindow?.onDismiss = { [weak self, weak window] in
                 DispatchQueue.main.async {
                     // Defer release through the next runloop tick to flush any
                     // pending CoreAnimation transactions before NSWindow
                     // deallocates — same crash pattern that bit the editor.
+                    // Identity check: a late dismiss from a torn-down window
+                    // must not null out a newer one that the user just opened.
+                    guard self?.currentMainWindow === window else { return }
                     self?.currentMainWindow = nil
                 }
             }
