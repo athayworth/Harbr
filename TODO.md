@@ -24,9 +24,16 @@ built but isn't really *offered* to anyone.
   to `appcast.xml` → commit. Without Sparkle users freeze on whatever
   version they first installed.
 
-- [ ] **Add `CHANGELOG.md` with versioned release notes** in
-  Keep-a-Changelog format. Backfill this session's work into versions
-  for each meaningful slice. Sparkle will eat from this format directly.
+- [x] **Add `CHANGELOG.md` with versioned release notes** in
+  Keep-a-Changelog format. Shipped 2026-06-05. `[Unreleased]`
+  accumulates everything merged since 2.0.0; `[2.0.0]` documents
+  the published baseline. Sparkle-readable. When cutting the next
+  release, rename `[Unreleased]` → `[X.Y.Z] - YYYY-MM-DD` and
+  start a fresh `[Unreleased]` block. The intermediate work that
+  landed between the 2.0.0 cut and this changelog (commits from
+  Feb–early June 2026) is intentionally bundled under
+  `[Unreleased]` rather than split into invented version numbers
+  that never actually shipped.
 
 - [ ] **Build a landing page** (harbr.app, a section on the author's
   studio site, or even a Vercel one-pager). Hero screenshot, three-feature
@@ -44,14 +51,17 @@ built but isn't really *offered* to anyone.
   mostly bullets right now — visuals would do more work than the
   bullets do.
 
-- [ ] **Per-project detail view with bigger CPU + memory charts.**
-  Double-click a row in the Projects table → sheet or replacement
-  pane with: name + port header, large CPU chart (last hour, 5s
-  samples = 720 points), large memory chart, uptime, last-restart
-  timestamp, action buttons, env vars list. The sparkline buffer
-  already exists for CPU; extend to memory + a longer window.
-  Optionally embed the Activity log scoped to this project, so the
-  detail view is the single-project deep dive.
+- [x] **Per-project detail view with bigger CPU + memory charts.**
+  Shipped 2026-06-05 as `ProjectDetailWindow`, opened as a sheet
+  from the Projects table's double-click handler. CPU sparkline
+  pinned to 100, memory sparkline auto-scales to peak × 1.1 so
+  flat-low projects don't render as a wall of fill. Live-refreshes
+  at 1 Hz from the existing 720-sample buffers. Action row:
+  Start/Stop (toggles on the live state), Restart, View Logs
+  (closes the sheet and focuses the Activity tab on this port via
+  `HarbrMainWindow.focusActivity(forPort:)`), Done. Env vars list
+  is a read-only NSTextView. Layout has not been visually verified
+  end-to-end — needs an eyeball pass on first build.
 
 - [x] **First-launch permission explanation banner.** Shipped
   2026-06-05 as an NSAlert run from `applicationDidFinishLaunching`,
