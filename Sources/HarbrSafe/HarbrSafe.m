@@ -1,3 +1,11 @@
+//
+//  HarbrSafe.m
+//  Harbr
+//
+//  Copyright (c) 2025 Alexander Hayworth
+//  Licensed under the MIT License. See LICENSE file for details.
+//
+
 #import "HarbrSafe.h"
 
 NSString * const HarbrSafeErrorDomain = @"com.harbr.app.HarbrSafe";

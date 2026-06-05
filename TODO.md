@@ -2,7 +2,7 @@
 
 Tracked work for getting Harbr from "polished side project" to "shippable
 indie utility." Reordered roughly by sequencing for a public launch.
-Last updated by Claude session on 2026-06-04.
+Last updated by Claude session on 2026-06-05.
 
 ## P0 — required to actually ship publicly
 
@@ -53,37 +53,37 @@ built but isn't really *offered* to anyone.
   Optionally embed the Activity log scoped to this project, so the
   detail view is the single-project deep dive.
 
-- [ ] **First-launch permission explanation banner.** Before macOS
-  shows the bare "Harbr would like to control Terminal" /
-  "Harbr would like to send notifications" prompts, surface a one-
-  time in-app banner explaining what they're for and that approving
-  makes the app work. Especially important for vibe coders who don't
-  recognize the system prompts. Gate via a UserDefaults bool so it
-  only shows on first run.
+- [x] **First-launch permission explanation banner.** Shipped
+  2026-06-05 as an NSAlert run from `applicationDidFinishLaunching`,
+  gated by the `com.harbr.app.didShowPermissionExplanation`
+  UserDefaults key so it fires exactly once per user. Explains both
+  the Notifications and the Terminal-control prompts before macOS
+  surfaces them. Notification request is deferred until the alert
+  is dismissed so the system prompt doesn't race the explainer.
 
-- [ ] **Persist desktop window frame + last selected tab.** Save
-  `NSStringFromRect(window.frame)` and `currentTab.rawValue` to
-  UserDefaults on `windowWillClose`; restore in `buildWindow` before
-  the first `switchTo()` call. Without this, every session repeats
-  the same "resize the window, click Activity" dance.
+- [x] **Persist desktop window frame + last selected tab.** Shipped
+  2026-06-05. Frame uses NSWindow's built-in `setFrameAutosaveName`
+  pair (autosave + `setFrameUsingName` at build, falling back to
+  `center()` on first run). Tab persists via UserDefaults key
+  `com.harbr.app.mainWindowLastTab`, written on `windowWillClose`
+  and read in `buildWindow` before the first `switchTo()`.
 
-- [ ] **Surface memory pressure + per-project memory warnings.**
-  System-level memory pressure indicator in the menu bar (small
-  symbol when macOS is under pressure). Per-project: highlight rows
-  using > 2 GB in red, with a "this project is contributing to
-  system slowness" hover hint. Comes out of the 2026-06-04 freeze
-  diagnosis where a user couldn't tell which of their stacked dev
-  servers was about to tip the system over.
+- [x] **Surface memory pressure + per-project memory warnings.**
+  Shipped 2026-06-05. Menu bar icon repaints via
+  `DispatchSource.makeMemoryPressureSource` — orange palette on
+  `.warning`, red on `.critical`, normal template otherwise, with
+  a tooltip stating the level. Projects table mem column now tints
+  red and adds a "contributing to system slowness" tooltip for
+  rows above the 2 GB heavy threshold.
 
 ## P2 — defensive / hygiene
 
-- [ ] **Cap log line length in `LogReader.tail`.** A dev server that
-  emits a 10 MB single line (minified progress bars, webpack with no
-  newlines) can freeze the Activity refresh timer when `NSTextView`
-  tries to render it. After splitting on newlines, truncate any line
-  over 8 KB with an ellipsis marker. Safer than capping the whole
-  read because long-but-bounded lines (compiler errors with full
-  paths) shouldn't get cropped — only pathological single-line outputs.
+- [x] **Cap log line length in `LogReader.tail`.** Shipped 2026-06-05.
+  Per-line cap at 8 KB (`maxLineBytes`) applied via a private
+  `capLine` helper after the newline split, so multi-KB compiler
+  errors still render in full but a pathological 10 MB minified
+  line gets truncated with an ellipsis + byte-count marker before
+  it reaches NSTextView.
 
 - [x] **Block second instance via `LSMultipleInstancesProhibited`.**
   Added to `Resources/Info.plist` (and patched into the installed
@@ -97,17 +97,18 @@ built but isn't really *offered* to anyone.
   must still be killed manually for the current session; this only
   prevents recurrence at next login.
 
-- [ ] **Guard rapid open/close lifecycle of `HarbrMainWindow`.** If
-  the user double-clicks "Open Harbr" or hits ⌘0 twice fast, an
-  in-flight `onDismiss` callback from the first window could land
-  after the second is set up and null out `currentMainWindow`. Add
-  `guard app?.currentMainWindow === self else { return }` identity
-  check at the top of the closure.
+- [x] **Guard rapid open/close lifecycle of `HarbrMainWindow`.**
+  Shipped 2026-06-05. `openMainWindow` now captures the freshly
+  built window into the `onDismiss` closure as a weak reference and
+  guards `currentMainWindow === window` before nulling, so a late
+  dismiss from a torn-down window can't clobber a newer one the
+  user just opened.
 
-- [ ] **Add MIT license headers** to `Sources/Harbr/SafeProcess.swift`,
-  `Sources/HarbrSafe/HarbrSafe.m`, and `Sources/HarbrSafe/HarbrSafe.h`.
-  `main.swift` has the standard 6-line MIT header; the other source
-  files don't. Trivial but matters for legal clarity.
+- [x] **Add MIT license headers** to `Sources/Harbr/SafeProcess.swift`,
+  `Sources/HarbrSafe/HarbrSafe.m`, and
+  `Sources/HarbrSafe/include/HarbrSafe.h` (true path — the TODO
+  originally listed the header without the `include/` segment).
+  Shipped 2026-06-05.
 
 ## P3 — code health (defer until it actually hurts)
 

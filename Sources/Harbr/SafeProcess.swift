@@ -1,3 +1,11 @@
+//
+//  SafeProcess.swift
+//  Harbr
+//
+//  Copyright (c) 2025 Alexander Hayworth
+//  Licensed under the MIT License. See LICENSE file for details.
+//
+
 import Foundation
 import Darwin
 import HarbrSafe
