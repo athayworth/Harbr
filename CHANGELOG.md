@@ -1,0 +1,82 @@
+# Changelog
+
+All notable changes to Harbr are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and Harbr follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Versions correspond to `CFBundleShortVersionString` in `Resources/Info.plist`,
+so a release listed here matches what Sparkle reads from the running app.
+
+## [Unreleased]
+
+This section accumulates work that has merged to `main` but hasn't been
+cut as a release yet. When the user is ready to ship, rename the heading
+to the new version + release date and start a fresh `[Unreleased]` block.
+
+### Added
+
+- Per-project detail view, opened by double-clicking a row in the
+  Projects table. Hosts CPU + memory sparklines over the full 1-hour
+  buffer (720 samples), live stats, env vars, and Start/Stop /
+  Restart / View Logs actions. View Logs jumps the main window to the
+  Activity tab focused on that port.
+- First-launch permission explanation. Before macOS surfaces the bare
+  "Harbr would like to send notifications" and "control Terminal"
+  prompts, Harbr now shows a one-time alert explaining what each is
+  for. Gated by the `com.harbr.app.didShowPermissionExplanation`
+  UserDefaults key.
+- macOS memory pressure indicator. The menu bar sailboat repaints
+  orange on `.warning` and red on `.critical` via a
+  `DispatchSource.MemoryPressureEvent` source, with a tooltip
+  stating the level. Driven by macOS, not project-level memory.
+- Per-project memory warning: the Projects table's Memory column
+  tints red and adds a tooltip ("contributing to system slowness")
+  for any row above the 2 GB heavy threshold.
+- Persisted main window frame and last selected tab. Frame uses
+  `NSWindow.setFrameAutosaveName`; tab is stored under
+  `com.harbr.app.mainWindowLastTab`.
+- Verdict engine + system health banner on the Projects tab.
+  Surfaces "compiling", "idle Xh", "climbing", "heavy memory",
+  "hot CPU" inline next to each project name; the banner
+  aggregates anything needing attention.
+- "Starting…" state shown for the brief window between Start being
+  clicked and the port binding, so slow-booting frameworks read as
+  intentional rather than broken.
+
+### Changed
+
+- Double-click on a project row now opens the detail view instead
+  of toggling start/restart. Use the row's primary action button
+  (or the detail view's Start/Stop button) for the previous behavior.
+
+### Fixed
+
+- Duplicate Harbr instances at login. `LSMultipleInstancesProhibited`
+  is now set in `Info.plist`, so even if both Harbr's own LaunchAgent
+  and a stale SMAppService login item fire at login, macOS refuses
+  to start a second instance.
+- Activity tab freezing on pathological log output. `LogReader.tail`
+  now caps any single line at 8 KB with an ellipsis marker, so a
+  10 MB minified single-line burst no longer wedges NSTextView.
+- Race in `HarbrMainWindow` open/close lifecycle. A late `onDismiss`
+  callback from a torn-down window can no longer null out a newer
+  window the user just opened — guarded with an identity check on
+  `currentMainWindow`.
+
+### Defense in depth / hygiene
+
+- MIT license headers added to `Sources/Harbr/SafeProcess.swift`,
+  `Sources/HarbrSafe/HarbrSafe.m`, and
+  `Sources/HarbrSafe/include/HarbrSafe.h` for parity with
+  `main.swift`.
+
+## [2.0.0] - 2026-02-14
+
+Initial public release. The menu bar dropdown plus the desktop
+window (Projects + Activity + Settings tabs), launch-at-login
+support, log capture per project, and the safety bridge that
+keeps subprocess failures from crashing the app are all part of
+this baseline.
+
+[Unreleased]: https://github.com/athayworth/Harbr/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/athayworth/Harbr/releases/tag/v2.0.0

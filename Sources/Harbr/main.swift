@@ -1068,6 +1068,330 @@ private class SidebarTabView: NSView {
     }
 }
 
+/// Per-project deep dive opened as a sheet from the Projects table. Hosts
+/// two larger sparklines (CPU pinned to 100, Memory auto-scaled to the
+/// peak of the buffer), live-refreshing stats, the project's env vars,
+/// and a row of action buttons. Lifetime is tied to the sheet — the
+/// refresh timer stops in `windowWillClose`.
+@MainActor
+class ProjectDetailWindow: NSObject, NSWindowDelegate {
+    private weak var app: HarbrApp?
+    private weak var parentWindow: NSWindow?
+    private weak var mainWindow: HarbrMainWindow?
+    private var window: NSWindow?
+    private let port: Int
+
+    private var statusDot: NSImageView?
+    private var verdictLabel: NSTextField?
+    private var cpuValueLabel: NSTextField?
+    private var memValueLabel: NSTextField?
+    private var uptimeLabel: NSTextField?
+    private var lastRestartLabel: NSTextField?
+    private var cpuChart: SparklineView?
+    private var memChart: SparklineView?
+    private var primaryActionButton: NSButton?
+
+    private var refreshTimer: Timer?
+    var onDismiss: (() -> Void)?
+    private var didDismiss = false
+
+    init(app: HarbrApp, mainWindow: HarbrMainWindow, parent: NSWindow, project: Project) {
+        self.app = app
+        self.mainWindow = mainWindow
+        self.parentWindow = parent
+        self.port = project.port
+        super.init()
+        build(for: project)
+    }
+
+    private func project() -> Project? {
+        app?.config?.projects.first(where: { $0.port == port })
+    }
+
+    func runSheet() {
+        guard let window, let parentWindow else { return }
+        parentWindow.beginSheet(window) { _ in }
+        refresh()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refresh()
+            }
+        }
+    }
+
+    private func endSheet() {
+        guard let window, let parentWindow else { return }
+        parentWindow.endSheet(window)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        guard !didDismiss else { return }
+        didDismiss = true
+        onDismiss?()
+    }
+
+    // MARK: Layout
+
+    private func build(for project: Project) {
+        // Coordinates are AppKit-default (origin lower-left). Window content
+        // is 620 wide × 560 tall. Rows lay out from top down with explicit
+        // y positions chosen so adjacent labels don't collide and the env
+        // block above the buttons gets enough room for a few KB of vars.
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = project.name
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        self.window = window
+        guard let content = window.contentView else { return }
+
+        // Header row at y≈520: status dot + name + port chip
+        let dot = NSImageView(frame: NSRect(x: 20, y: 522, width: 16, height: 16))
+        dot.image = NSImage(systemSymbolName: "circle", accessibilityDescription: "Status")
+        content.addSubview(dot)
+        self.statusDot = dot
+
+        let title = NSTextField(labelWithString: project.name)
+        title.frame = NSRect(x: 44, y: 516, width: 380, height: 26)
+        title.font = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        content.addSubview(title)
+
+        let portChip = NSTextField(labelWithString: ":\(project.port)")
+        portChip.frame = NSRect(x: 44 + title.intrinsicContentSize.width + 8, y: 522, width: 80, height: 18)
+        portChip.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        portChip.textColor = .secondaryLabelColor
+        content.addSubview(portChip)
+
+        let verdict = NSTextField(labelWithString: "")
+        verdict.frame = NSRect(x: 20, y: 492, width: 580, height: 18)
+        verdict.font = NSFont.systemFont(ofSize: 11)
+        verdict.textColor = .secondaryLabelColor
+        content.addSubview(verdict)
+        self.verdictLabel = verdict
+
+        // Stats strip — label on top, big value beneath. statsTopY is the
+        // top edge of the label row; value sits 24 lower.
+        let statValueY: CGFloat = 442
+        let statLabelY: CGFloat = statValueY + 26
+        let (cpuValue, _) = statBox(valueY: statValueY, labelY: statLabelY, x: 20, width: 110, label: "CPU", initial: "—")
+        let (memValue, _) = statBox(valueY: statValueY, labelY: statLabelY, x: 140, width: 130, label: "Memory", initial: "—")
+        let (upValue, _) = statBox(valueY: statValueY, labelY: statLabelY, x: 280, width: 150, label: "Uptime", initial: "—")
+        let (restartValue, _) = statBox(valueY: statValueY, labelY: statLabelY, x: 440, width: 160, label: "Last restart", initial: "—")
+        for v in [cpuValue, memValue, upValue, restartValue] { content.addSubview(v.label); content.addSubview(v.value) }
+        self.cpuValueLabel = cpuValue.value
+        self.memValueLabel = memValue.value
+        self.uptimeLabel = upValue.value
+        self.lastRestartLabel = restartValue.value
+
+        // Charts row at y=250..390 with headers at y=394..410
+        let chartsY: CGFloat = 250
+        let chartHeight: CGFloat = 140
+        let chartWidth: CGFloat = 280
+
+        let cpuHeader = NSTextField(labelWithString: "CPU — last hour")
+        cpuHeader.frame = NSRect(x: 20, y: chartsY + chartHeight + 4, width: chartWidth, height: 16)
+        cpuHeader.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        cpuHeader.textColor = .secondaryLabelColor
+        content.addSubview(cpuHeader)
+
+        let memHeader = NSTextField(labelWithString: "Memory — last hour")
+        memHeader.frame = NSRect(x: 320, y: chartsY + chartHeight + 4, width: chartWidth, height: 16)
+        memHeader.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        memHeader.textColor = .secondaryLabelColor
+        content.addSubview(memHeader)
+
+        let cpuBox = chartBox(frame: NSRect(x: 20, y: chartsY, width: chartWidth, height: chartHeight))
+        content.addSubview(cpuBox.container)
+        self.cpuChart = cpuBox.chart
+
+        let memBox = chartBox(frame: NSRect(x: 320, y: chartsY, width: chartWidth, height: chartHeight))
+        content.addSubview(memBox.container)
+        self.memChart = memBox.chart
+
+        // Env vars block: header at y=224..240, scroll at y=64..220
+        let envHeader = NSTextField(labelWithString: "Environment variables")
+        envHeader.frame = NSRect(x: 20, y: 224, width: 300, height: 16)
+        envHeader.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        envHeader.textColor = .secondaryLabelColor
+        content.addSubview(envHeader)
+
+        let envScroll = NSScrollView(frame: NSRect(x: 20, y: 64, width: 580, height: 156))
+        envScroll.hasVerticalScroller = true
+        envScroll.borderType = .lineBorder
+        let envText = NSTextView(frame: envScroll.bounds)
+        envText.isEditable = false
+        envText.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        envText.textContainerInset = NSSize(width: 8, height: 8)
+        envText.string = formatEnvVars(project.envVars)
+        envScroll.documentView = envText
+        content.addSubview(envScroll)
+
+        // Action buttons at y=20..48
+        let primary = NSButton(title: "Start", target: self, action: #selector(primaryAction))
+        primary.bezelStyle = .rounded
+        primary.frame = NSRect(x: 20, y: 20, width: 90, height: 28)
+        if #available(macOS 11.0, *) { primary.bezelColor = .controlAccentColor }
+        content.addSubview(primary)
+        self.primaryActionButton = primary
+
+        let restart = NSButton(title: "Restart", target: self, action: #selector(restartAction))
+        restart.bezelStyle = .rounded
+        restart.frame = NSRect(x: 118, y: 20, width: 80, height: 28)
+        content.addSubview(restart)
+
+        let logs = NSButton(title: "View Logs", target: self, action: #selector(viewLogsAction))
+        logs.bezelStyle = .rounded
+        logs.frame = NSRect(x: 206, y: 20, width: 90, height: 28)
+        content.addSubview(logs)
+
+        let done = NSButton(title: "Done", target: self, action: #selector(doneAction))
+        done.bezelStyle = .rounded
+        done.keyEquivalent = "\r"
+        done.frame = NSRect(x: 520, y: 20, width: 80, height: 28)
+        content.addSubview(done)
+    }
+
+    private struct StatPair { let label: NSTextField; let value: NSTextField }
+
+    private func statBox(valueY: CGFloat, labelY: CGFloat, x: CGFloat, width: CGFloat, label: String, initial: String) -> (StatPair, Void) {
+        let labelView = NSTextField(labelWithString: label)
+        labelView.frame = NSRect(x: x, y: labelY, width: width, height: 14)
+        labelView.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        labelView.textColor = .tertiaryLabelColor
+
+        let valueView = NSTextField(labelWithString: initial)
+        valueView.frame = NSRect(x: x, y: valueY, width: width, height: 22)
+        valueView.font = NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .regular)
+        valueView.textColor = .labelColor
+        return (StatPair(label: labelView, value: valueView), ())
+    }
+
+    private func chartBox(frame: NSRect) -> (container: NSView, chart: SparklineView) {
+        let container = NSView(frame: frame)
+        container.wantsLayer = true
+        container.layer?.borderColor = NSColor.separatorColor.cgColor
+        container.layer?.borderWidth = 1
+        container.layer?.cornerRadius = 6
+        let inset: CGFloat = 8
+        let chart = SparklineView(frame: NSRect(x: inset, y: inset, width: frame.width - inset * 2, height: frame.height - inset * 2))
+        chart.autoresizingMask = [.width, .height]
+        container.addSubview(chart)
+        return (container, chart)
+    }
+
+    private func formatEnvVars(_ vars: [String: String]?) -> String {
+        guard let vars, !vars.isEmpty else {
+            return "(none configured)"
+        }
+        return vars.keys.sorted().map { key in "\(key)=\(vars[key] ?? "")" }.joined(separator: "\n")
+    }
+
+    // MARK: Refresh
+
+    private func refresh() {
+        guard let app, let project = project() else { return }
+        let status = app.portStatusCache[port]
+        let active = status?.isActive ?? false
+
+        let symbol: String = active ? "circle.fill" : "circle"
+        statusDot?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: active ? "Running" : "Stopped")
+        statusDot?.contentTintColor = active
+            ? (status?.healthStatus == false ? .systemYellow : .systemGreen)
+            : .tertiaryLabelColor
+
+        if let v = app.verdict(for: project) {
+            verdictLabel?.stringValue = v.displayText
+            verdictLabel?.textColor = v.isAttention ? .systemOrange : .secondaryLabelColor
+        } else {
+            verdictLabel?.stringValue = active ? "Running normally" : "Stopped"
+            verdictLabel?.textColor = .secondaryLabelColor
+        }
+
+        cpuValueLabel?.stringValue = active
+            ? (status?.cpuUsage).map { String(format: "%.0f%%", $0) } ?? "—"
+            : "—"
+        if let mem = status?.memoryUsage, active {
+            memValueLabel?.stringValue = HarbrApp.formatMemory(mem)
+            memValueLabel?.textColor = mem > 2048 ? .systemRed : .labelColor
+        } else {
+            memValueLabel?.stringValue = "—"
+            memValueLabel?.textColor = .labelColor
+        }
+        uptimeLabel?.stringValue = formatUptime(spawnAt: app.lastSpawnAt[port], active: active)
+        lastRestartLabel?.stringValue = formatLastRestart(app.lastSpawnAt[port])
+
+        // CPU chart stays pinned to 100%. Memory chart auto-scales to the
+        // peak of the buffer + 10% headroom so a flat-low project doesn't
+        // render as a wall of fill — but a 3 GB spike still reads as a spike.
+        let cpuSamples = app.cpuHistory[port] ?? []
+        cpuChart?.ceiling = 100
+        cpuChart?.samples = cpuSamples
+
+        let memSamples = app.memHistory[port] ?? []
+        let peak = memSamples.max() ?? 0
+        memChart?.ceiling = max(128, peak * 1.1)
+        memChart?.samples = memSamples
+
+        primaryActionButton?.title = active ? "Stop" : "Start"
+    }
+
+    private func formatUptime(spawnAt: Date?, active: Bool) -> String {
+        guard active, let spawnAt else { return "—" }
+        let secs = Int(Date().timeIntervalSince(spawnAt))
+        if secs < 60 { return "\(secs)s" }
+        if secs < 3600 { return "\(secs / 60)m \(secs % 60)s" }
+        let h = secs / 3600
+        let m = (secs % 3600) / 60
+        return "\(h)h \(m)m"
+    }
+
+    private func formatLastRestart(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        let sameDay = Calendar.current.isDate(date, inSameDayAs: Date())
+        if sameDay { return formatter.string(from: date) }
+        formatter.dateStyle = .short
+        return formatter.string(from: date)
+    }
+
+    // MARK: Actions
+
+    @MainActor @objc private func primaryAction() {
+        guard let app, let project = project() else { return }
+        if app.portStatusCache[port]?.isActive == true {
+            app.stopProjectByPort(port)
+        } else {
+            app.startProjectDirectly(project)
+        }
+    }
+
+    @MainActor @objc private func restartAction() {
+        guard let app, let project = project() else { return }
+        app.restartProjectDirectly(project)
+    }
+
+    @MainActor @objc private func viewLogsAction() {
+        let port = self.port
+        let main = mainWindow
+        endSheet()
+        DispatchQueue.main.async {
+            main?.focusActivity(forPort: port)
+        }
+    }
+
+    @MainActor @objc private func doneAction() {
+        endSheet()
+    }
+}
+
 /// The desktop window — a sidebar + content area surface where users can
 /// see all their projects in a sortable table, peek at recent server
 /// output, and adjust app-wide settings. The menu bar dropdown stays the
@@ -1104,6 +1428,10 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     private var notificationsCheckbox: NSButton?
     private var launchAtLoginCheckbox: NSButton?
     private var captureLogsDefaultLabel: NSTextField?
+
+    // Currently open per-project detail sheet, retained here so the sheet
+    // outlives the table click that opened it.
+    private var detailWindow: ProjectDetailWindow?
 
     var onDismiss: (() -> Void)?
     private var didDismiss = false
@@ -1516,13 +1844,17 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
     @MainActor @objc private func projectsTableDoubleClicked() {
         guard let row = projectsTable?.selectedRow, row >= 0,
-              let project = app?.config?.projects[safe: row] else { return }
-        let active = app?.portStatusCache[project.port]?.isActive ?? false
-        if active {
-            app?.restartProjectDirectly(project)
-        } else {
-            app?.startProjectDirectly(project)
+              let project = app?.config?.projects[safe: row],
+              let app, let parent = window else { return }
+        let detail = ProjectDetailWindow(app: app, mainWindow: self, parent: parent, project: project)
+        detail.onDismiss = { [weak self, weak detail] in
+            // Identity check: a late dismiss from a torn-down sheet shouldn't
+            // null out a newer one the user opened on top.
+            guard self?.detailWindow === detail else { return }
+            self?.detailWindow = nil
         }
+        detailWindow = detail
+        detail.runSheet()
     }
 
     @MainActor @objc private func startFromTable(_ sender: NSButton) {
@@ -1894,6 +2226,20 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     /// Public entry point so the ⌘, menu item can open the window directly
     /// to Settings instead of whatever tab was last viewed.
     @MainActor func switchToSettings() { switchTo(.settings) }
+
+    /// Switch to the Activity tab and focus the log stream on a specific
+    /// project's port. Called from the per-project detail sheet's
+    /// "View Logs" action so the user can keep reading without re-finding
+    /// the project in the activity-tab sidebar.
+    @MainActor func focusActivity(forPort port: Int) {
+        switchTo(.activity)
+        guard let projects = app?.config?.projects,
+              let row = projects.firstIndex(where: { $0.port == port }) else { return }
+        activitySelectedPort = port
+        activityProjectList?.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        refreshActivityText()
+        window?.makeKeyAndOrderFront(nil)
+    }
 
     // MARK: Lifecycle
 
