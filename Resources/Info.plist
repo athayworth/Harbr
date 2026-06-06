@@ -32,5 +32,16 @@
     <string>Copyright © 2025 Alexander Hayworth. All rights reserved.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Harbr needs to control Terminal to start and manage your development servers.</string>
+    <!--
+        Sparkle keys (in-app auto-update). Both are placeholders — the
+        runtime gate in UpdateManager.isConfigured() detects the
+        "REPLACE_WITH_" prefix and refuses to start Sparkle. Swap in real
+        values when generating EdDSA keys + picking an appcast host.
+        See Sources/Harbr/UpdateManager.swift for the procedure.
+    -->
+    <key>SUFeedURL</key>
+    <string>REPLACE_WITH_APPCAST_URL</string>
+    <key>SUPublicEDKey</key>
+    <string>REPLACE_WITH_EDDSA_PUBLIC_KEY</string>
 </dict>
 </plist>
