@@ -15,6 +15,15 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Added
 
+- Docker-aware CPU + memory stats. When a project's port is held by
+  the Docker Desktop proxy (`com.docker.backend`) the existing
+  PS-based path reads near-zero CPU and a few hundred KB of memory
+  regardless of real load. Harbr now shells out to `docker ps` +
+  `docker stats` once per poll cycle, joins the host port → container
+  mapping with the project list, and substitutes the container's real
+  numbers wherever they're available. PS-based stats remain the path
+  for non-Docker projects, and the whole feature is a no-op if Docker
+  isn't installed or the daemon is stopped.
 - Per-project detail view, opened by double-clicking a row in the
   Projects table. Hosts CPU + memory sparklines over the full 1-hour
   buffer (720 samples), live stats, env vars, and Start/Stop /
