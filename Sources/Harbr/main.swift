@@ -1960,6 +1960,12 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         leftScroll.documentView = leftTable
         container.addSubview(leftScroll)
         self.activityProjectList = leftTable
+        // NSTableView won't fetch rows on first display unless reloadData
+        // is called after the data source is wired — without this the
+        // left picker stays blank until the 5s poll triggers reloadFromPoll,
+        // and the selectRowIndexes call below silently no-ops because the
+        // table believes it has zero rows.
+        leftTable.reloadData()
 
         // Right: log text view
         let rightX: CGFloat = 20 + leftWidth + 12
