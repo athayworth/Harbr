@@ -2898,15 +2898,29 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var newCache: [Int: PortStatus] = [:]
             var stateChanges: [(project: Project, started: Bool)] = []
 
+            // Sample Docker once per cycle so we don't re-spawn `docker ps`
+            // + `docker stats` per project. The map is host_port → real
+            // container stats; non-Docker ports stay on the PS-based path
+            // below. Empty if Docker isn't installed or the daemon is down.
+            let dockerSamples = DockerStats.samplesByHostPort()
+
             // Phase 1 — port + resource sampling (serial, fast).
             for project in projectsCopy {
                 let isActive = self?.isPortActive(project.port) ?? false
                 var cpu: Double? = nil
                 var mem: Double? = nil
 
-                if isActive, let usage = self?.getResourceUsage(for: project.port) {
-                    cpu = usage.cpu
-                    mem = usage.mem
+                if isActive {
+                    if let docker = dockerSamples[project.port] {
+                        // Prefer Docker's view because PS would only see
+                        // the proxy process, which reads as ~0% CPU and a
+                        // few hundred KB regardless of real load.
+                        cpu = docker.cpu
+                        mem = docker.memMB
+                    } else if let usage = self?.getResourceUsage(for: project.port) {
+                        cpu = usage.cpu
+                        mem = usage.mem
+                    }
                 }
 
                 newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem, healthStatus: nil)
