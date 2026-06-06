@@ -2361,6 +2361,11 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// without polling.
     var memoryPressureSource: DispatchSourceMemoryPressure?
     var currentMemoryPressure: DispatchSource.MemoryPressureEvent = .normal
+    /// Sparkle wrapper. `updateManager.isAvailable` is false until the
+    /// Info.plist SUPublicEDKey / SUFeedURL placeholders are replaced
+    /// with real values, so the "Check for Updates…" menu item shows
+    /// as disabled until the project is actually shipping updates.
+    var updateManager: UpdateManager?
     var currentEditorWindow: ProjectEditorWindow?
     var currentScannerWindow: ProjectScannerWindow?
     var currentMainWindow: HarbrMainWindow?
@@ -2402,6 +2407,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         loadConfig()
         Self.ensureLogsDir()
+        updateManager = UpdateManager()
         buildAppMainMenu()
 
         // First-launch users get an in-app explainer before macOS surfaces
@@ -4130,6 +4136,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appMenu.addItem(NSMenuItem(title: "About Harbr",
                                     action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                                     keyEquivalent: ""))
+        // Standard macOS placement for the updater item is right under About,
+        // above Settings. Disabled (no target → menu item shows greyed) when
+        // Sparkle isn't configured, so the affordance is discoverable but not
+        // misleading before the project is set up to publish updates.
+        let updateItem = NSMenuItem(title: "Check for Updates…",
+                                     action: #selector(UpdateManager.checkForUpdates(_:)),
+                                     keyEquivalent: "")
+        if let manager = updateManager, manager.isAvailable {
+            updateItem.target = manager
+        }
+        appMenu.addItem(updateItem)
         appMenu.addItem(.separator())
         let prefsItem = NSMenuItem(title: "Settings…",
                                     action: #selector(openSettingsWindow),

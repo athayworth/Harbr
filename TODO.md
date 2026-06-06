@@ -2,27 +2,79 @@
 
 Tracked work for getting Harbr from "polished side project" to "shippable
 indie utility." Reordered roughly by sequencing for a public launch.
-Last updated by Claude session on 2026-06-05.
+Last updated by Claude session on 2026-06-06.
 
-## P0 — required to actually ship publicly
+## Externally blocked — need you, not the code
 
-These four unlock distribution. Without them, the app can be cloned and
-built but isn't really *offered* to anyone.
+These can't ship from inside the session — they need an account, a key,
+a domain, or a screenshot only you can take. The code scaffolding for
+each is in place where it makes sense (see sub-bullets); the blocking
+work is what's left.
 
-- [ ] **Get an Apple Developer account ($99/yr) and notarize Harbr.app.**
-  Single biggest unlock — without it every downloader hits Gatekeeper's
-  "can't verify developer" warning. `scripts/install.sh` already accepts a
-  `CODESIGN_IDENTITY` env var; need to add a `scripts/notarize.sh` that
-  signs, zips, submits to `xcrun notarytool`, waits, and staples the ticket.
-  Output: a `Harbr.app.zip` users can download and just double-click.
+### Apple notarization
+- [x] **`scripts/notarize.sh` scaffolded** (2026-06-06). Builds a fresh
+  bundle under `dist/`, signs with Developer ID + hardened runtime +
+  timestamp, submits to `xcrun notarytool --wait`, staples, and
+  re-zips for distribution. Refuses ad-hoc identity so it can't be
+  accidentally pointed at a non-notarizable build.
+- [ ] **Get the Apple Developer account ($99/yr).** Without it nothing
+  else in this section works — `notarytool` requires an enrolled Apple
+  ID, an app-specific password, and a 10-character Team ID. Output to
+  unblock: those three values, exported into the shell when you run
+  `notarize.sh`.
+- [ ] **First notarized run.** Confirms the script works end-to-end,
+  produces `dist/Harbr.app.zip`, and that fresh-Mac Gatekeeper accepts
+  the bundle without a Right-Click → Open dance.
 
-- [ ] **Integrate Sparkle for in-app auto-updates.** SwiftPM dep on
-  Sparkle 2.x. Generate EdDSA signing keys (private key outside the
-  repo), host `appcast.xml` on GitHub Pages or the landing page, wire
-  `SUUpdater.shared` to the feed URL. Each release becomes: build →
-  notarize → zip → upload to GitHub Releases → append release notes
-  to `appcast.xml` → commit. Without Sparkle users freeze on whatever
-  version they first installed.
+### Sparkle auto-update
+- [x] **Sparkle 2.x added as a SwiftPM dependency** in `Package.swift`
+  with `from: "2.6.0"`. SourceKit resolves it; `swift build` links
+  cleanly.
+- [x] **`UpdateManager` wrapper** in `Sources/Harbr/UpdateManager.swift`.
+  Initializes `SPUStandardUpdaterController` only when both
+  `SUPublicEDKey` and `SUFeedURL` in Info.plist have been replaced
+  with real (non-`REPLACE_WITH_`) values. Wires a "Check for
+  Updates…" item into the app menu directly under About; it shows
+  as disabled until the keys are filled in, so the affordance is
+  discoverable but doesn't lie.
+- [x] **Info.plist placeholders** (`SUFeedURL`, `SUPublicEDKey`) added
+  with `REPLACE_WITH_…` sentinels so `UpdateManager` can detect
+  unconfigured state.
+- [x] **`docs/appcast.xml` template** committed with a commented-out
+  `<item>` showing what each release entry should look like
+  (`enclosure url`, `length`, `sparkle:edSignature`).
+- [ ] **Generate EdDSA signing keys.** Run the Sparkle `generate_keys`
+  tool from a Sparkle release zip. Private key goes into the macOS
+  Keychain (don't commit, don't email, don't paste in chat); public
+  key replaces `SUPublicEDKey` in Resources/Info.plist.
+- [ ] **Pick the appcast hosting URL** and replace `SUFeedURL`. GitHub
+  Pages on the Harbr repo is the lowest-effort option:
+  `https://athayworth.github.io/Harbr/appcast.xml`. The landing page
+  domain (when it exists) is a reasonable upgrade.
+- [ ] **Cut the first Sparkle-aware release.** After notarization +
+  keys: zip the stapled bundle, upload to a GitHub Release tagged
+  `vX.Y.Z`, fill in the appcast template with the URL + EdDSA
+  signature + byte length, push appcast.xml. Subsequent releases
+  repeat that loop.
+
+### Landing page
+- [ ] **Build a landing page** (harbr.app, a section on the studio site,
+  or a Vercel one-pager). Hero screenshot, three-feature pitch,
+  download button to the notarized zip, link to GitHub, link to
+  CHANGELOG. Pure design + copy work; nothing in the repo blocks it,
+  but nothing in the repo can do it either. Without an install
+  destination that isn't a `git clone`, there's nowhere to point
+  people in a tweet.
+
+### README screenshots
+- [ ] **Add README screenshots of the menu bar dropdown + desktop
+  window.** Three shots in light + dark mode: (1) menu bar dropdown
+  with project list + CPU/MEM suffix, (2) desktop window's Projects
+  tab with sparklines, (3) Activity tab with Next.js logs streaming.
+  Store under `docs/screenshots/`. Has to be taken from your running
+  app — Claude can't capture the macOS window itself.
+
+## P0 — shipped
 
 - [x] **Add `CHANGELOG.md` with versioned release notes** in
   Keep-a-Changelog format. Shipped 2026-06-05. `[Unreleased]`
@@ -35,21 +87,7 @@ built but isn't really *offered* to anyone.
   `[Unreleased]` rather than split into invented version numbers
   that never actually shipped.
 
-- [ ] **Build a landing page** (harbr.app, a section on the author's
-  studio site, or even a Vercel one-pager). Hero screenshot, three-feature
-  pitch, download button to the notarized zip, link to GitHub, link to
-  CHANGELOG. Without an install destination that isn't a `git clone`,
-  there's nowhere to point people in a tweet.
-
 ## P1 — polish that closes the "feels paid" gap
-
-- [ ] **Add README screenshots of the menu bar dropdown + desktop
-  window.** Three shots in light + dark mode: (1) menu bar dropdown
-  with project list + CPU/MEM suffix, (2) desktop window's Projects
-  tab with sparklines, (3) Activity tab with Next.js logs streaming.
-  Store under `docs/screenshots/`. README's "Features" section is
-  mostly bullets right now — visuals would do more work than the
-  bullets do.
 
 - [x] **Per-project detail view with bigger CPU + memory charts.**
   Shipped 2026-06-05 as `ProjectDetailWindow`, opened as a sheet

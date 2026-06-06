@@ -15,6 +15,21 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Added
 
+- Sparkle 2.x scaffolding for in-app auto-updates. `Package.swift`
+  pulls Sparkle; `UpdateManager` initializes
+  `SPUStandardUpdaterController` only when Info.plist's
+  `SUPublicEDKey` and `SUFeedURL` have been swapped from
+  `REPLACE_WITH_…` to real values, so the app still builds and runs
+  on a fresh clone. "Check for Updates…" menu item shows in the
+  Harbr menu and is disabled until those keys are filled in. The
+  appcast template ships as `docs/appcast.xml` with a worked
+  example of an `<item>` block for a release.
+- `scripts/notarize.sh` for producing a notarized, stapled,
+  distributable `dist/Harbr.app.zip`. Reads four env vars
+  (`CODESIGN_IDENTITY`, `APPLE_ID`, `APP_SPECIFIC_PASSWORD`,
+  `TEAM_ID`), enforces hardened runtime + timestamp on the
+  signature, submits via `xcrun notarytool --wait`, staples, and
+  re-zips. Refuses ad-hoc signing so it can't be misused.
 - Docker-aware CPU + memory stats. When a project's port is held by
   the Docker Desktop proxy (`com.docker.backend`) the existing
   PS-based path reads near-zero CPU and a few hundred KB of memory
