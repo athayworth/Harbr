@@ -1690,6 +1690,18 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             col.title = title
             col.width = width
             col.minWidth = width * 0.6
+            // Without an autoresizingMask on at least one column, any
+            // window width beyond the sum of column widths (~684 px)
+            // shows up as empty area to the right of the Actions column
+            // instead of expanding the table. Name absorbs the extra
+            // space because long project names benefit from it the most
+            // — Port / CPU / Memory render compact numbers that don't
+            // need to grow.
+            if id == "name" {
+                col.resizingMask = [.autoresizingMask, .userResizingMask]
+            } else {
+                col.resizingMask = .userResizingMask
+            }
             table.addTableColumn(col)
         }
         table.dataSource = self
