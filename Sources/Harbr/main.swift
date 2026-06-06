@@ -1444,7 +1444,12 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
     @MainActor private func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 560),
+            // Width sized to fit the Projects tab without clipping the
+            // Actions column: 180 sidebar + 1 divider + 20 L pad + 684
+            // column widths + ~21 intercolumn + 20 R pad ≈ 926, rounded
+            // up to 980 for a small visual buffer. minSize matches so
+            // users can't shrink past the Start/Stop button column.
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -1452,7 +1457,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         window.title = "Harbr"
         window.delegate = self
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 720, height: 420)
+        window.minSize = NSSize(width: 940, height: 460)
         if #available(macOS 11.0, *) {
             window.titlebarAppearsTransparent = false
             window.toolbarStyle = .unified
