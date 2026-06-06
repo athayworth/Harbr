@@ -71,6 +71,12 @@ mkdir -p "$APP_PATH/Contents/MacOS"
 mkdir -p "$APP_PATH/Contents/Resources"
 
 cp "$BUILD_DIR/Harbr" "$APP_PATH/Contents/MacOS/"
+# See install.sh for why this is needed — SwiftPM's default rpath of
+# @executable_path doesn't reach /Contents/Frameworks/, so dyld can't
+# find embedded frameworks (Sparkle) at launch.
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "$APP_PATH/Contents/MacOS/Harbr" 2>/dev/null || true
+
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_PATH/Contents/"
 echo -n "APPL????" > "$APP_PATH/Contents/PkgInfo"
 
@@ -78,6 +84,20 @@ if [ -f "$PROJECT_DIR/AppIcon.icns" ]; then
     cp "$PROJECT_DIR/AppIcon.icns" "$APP_PATH/Contents/Resources/"
 elif [ -f "$PROJECT_DIR/Resources/AppIcon.icns" ]; then
     cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_PATH/Contents/Resources/"
+fi
+
+# Embed Sparkle.framework (XPC services + helper apps included) so the
+# notarized bundle is launch-ready out of the box. See install.sh for the
+# detailed rationale; we duplicate the steps here because notarize.sh
+# builds its own bundle under dist/ rather than reusing install.sh's.
+SPARKLE_FRAMEWORK="$PROJECT_DIR/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+if [ -d "$SPARKLE_FRAMEWORK" ]; then
+    mkdir -p "$APP_PATH/Contents/Frameworks"
+    ditto "$SPARKLE_FRAMEWORK" "$APP_PATH/Contents/Frameworks/Sparkle.framework"
+else
+    echo "error: Sparkle.framework not found at $SPARKLE_FRAMEWORK" >&2
+    echo "       Run 'swift package resolve' to fetch Sparkle, then retry." >&2
+    exit 1
 fi
 
 echo "→ Signing with $CODESIGN_IDENTITY (hardened runtime + timestamp)…"

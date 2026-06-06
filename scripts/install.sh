@@ -36,15 +36,39 @@ echo "Creating app bundle..."
 # Create app bundle structure
 mkdir -p "$APP_PATH/Contents/MacOS"
 mkdir -p "$APP_PATH/Contents/Resources"
+mkdir -p "$APP_PATH/Contents/Frameworks"
 
 # Copy executable
 cp "$BUILD_DIR/Harbr" "$APP_PATH/Contents/MacOS/"
+
+# SwiftPM emits an rpath of just @executable_path, which doesn't point at
+# the standard /Contents/Frameworks/ dir. Without this, dyld can't find
+# the embedded Sparkle.framework at launch and the app dies before
+# reaching applicationDidFinishLaunching. install_name_tool adds the
+# bundle-relative rpath in place.
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "$APP_PATH/Contents/MacOS/Harbr" 2>/dev/null || true
 
 # Copy Info.plist
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_PATH/Contents/"
 
 # Create PkgInfo
 echo -n "APPL????" > "$APP_PATH/Contents/PkgInfo"
+
+# Embed Sparkle.framework so dyld can resolve @rpath/Sparkle.framework at
+# launch. SwiftPM extracts the xcframework under .build/artifacts/, and
+# we copy the macOS slice into the bundle's Frameworks directory. The
+# framework includes XPC services (Downloader.xpc, Installer.xpc) and an
+# Updater.app helper — `cp -R` keeps the bundle intact. ditto preserves
+# symlinks the framework relies on for its versioned layout.
+SPARKLE_FRAMEWORK="$PROJECT_DIR/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+if [ -d "$SPARKLE_FRAMEWORK" ]; then
+    rm -rf "$APP_PATH/Contents/Frameworks/Sparkle.framework"
+    ditto "$SPARKLE_FRAMEWORK" "$APP_PATH/Contents/Frameworks/Sparkle.framework"
+else
+    echo "warning: Sparkle.framework not found at $SPARKLE_FRAMEWORK — the app will fail to launch." >&2
+    echo "         Run 'swift package resolve' to fetch Sparkle, then retry." >&2
+fi
 
 # Copy icon — try project root first (where AppIcon.icns actually lives)
 # then Resources/ as a fallback.

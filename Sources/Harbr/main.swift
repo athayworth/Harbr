@@ -937,12 +937,14 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
 enum MainWindowTab: String, CaseIterable {
     case projects = "Projects"
     case activity = "Activity"
+    case help = "Help"
     case settings = "Settings"
 
     var sfSymbol: String {
         switch self {
         case .projects: return "list.bullet.rectangle"
         case .activity: return "text.alignleft"
+        case .help: return "questionmark.circle"
         case .settings: return "gearshape"
         }
     }
@@ -1015,6 +1017,14 @@ private class SparklineView: NSView {
 /// reloadData), and the look-and-feel we want — icon + label, accent
 /// highlight on selection, full row click target — is faster to draw
 /// directly than to fight cell-view lifecycle.
+/// NSView with a flipped coordinate system (origin at top-left). Used as
+/// the document view of NSScrollViews that host top-down text content
+/// (e.g. the Help tab) so the stack of sections grows downward and the
+/// scroll bar's initial position is at the top.
+private class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 private class SidebarTabView: NSView {
     let tab: MainWindowTab
     var isSelected: Bool = false { didSet { needsDisplay = true; updateColors() } }
@@ -1578,6 +1588,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         switch tab {
         case .projects: buildProjectsTab(in: container)
         case .activity: buildActivityTab(in: container)
+        case .help: buildHelpTab(in: container)
         case .settings: buildSettingsTab(in: container)
         }
     }
@@ -2050,6 +2061,220 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         if atBottom {
             textView.scrollToEndOfDocument(nil)
         }
+    }
+
+    // MARK: Help tab
+
+    /// One short explanation per term Harbr surfaces in its UI. Kept in
+    /// plain Swift instead of a .md / .json so the wording lives next to
+    /// the code that uses the terms — when a verdict label changes in
+    /// `ProjectVerdict`, the corresponding Help blurb is one screen away.
+    /// Keep entries short — 2–4 sentences. The audience is someone who
+    /// can ship features with an LLM but hasn't memorized what "memory
+    /// pressure" or "CPU%" formally mean.
+    private static let helpSections: [(title: String, body: String)] = [
+        (
+            title: "Port",
+            body: """
+            Every dev server "claims" a port — a number like 3000 or 5432 — and any \
+            request to localhost:PORT is routed to that server. Harbr watches the \
+            port to tell if your server is up; what you see at localhost:3000 in \
+            your browser is the same thing Harbr is tracking. Two servers can't \
+            share a port, which is why you'll see "EADDRINUSE" if you start the \
+            same project twice.
+            """
+        ),
+        (
+            title: "CPU %",
+            body: """
+            The percent shown is "percent of one CPU core," not percent of your \
+            whole Mac. On a 4-core machine the system has 400% available — so \
+            80% means one core is mostly busy, not that 80% of your computer is \
+            in use. Dev servers usually idle near 0% and spike to 50–200% during \
+            a compile, then settle back down. Sustained high CPU when nothing's \
+            compiling is the case worth investigating.
+            """
+        ),
+        (
+            title: "Memory (RAM)",
+            body: """
+            How much RAM the server's process is using right now, in MB or GB. \
+            Big frameworks (Next.js, Vite, Rails) typically start around 200–400 \
+            MB and grow as hot-reload caches build up. 1 GB+ is normal for a busy \
+            project; above 2 GB Harbr tints the row red because at that size a \
+            single project starts noticeably contributing to system slowness on a \
+            16 GB Mac.
+            """
+        ),
+        (
+            title: "macOS memory pressure",
+            body: """
+            A system-wide signal from macOS about how much free RAM is left. The \
+            menu bar sailboat turns orange when macOS is under "warning" pressure \
+            (it's compressing memory pages — apps still work but everything feels \
+            slower) and red on "critical" (macOS is about to start force-closing \
+            background apps). When you see orange or red, the move is to close \
+            tabs, quit apps you're not using, or stop a Harbr project that's \
+            sitting idle.
+            """
+        ),
+        (
+            title: "Trend sparkline",
+            body: """
+            The little line in the Trend column is the project's recent CPU \
+            history — about the last five minutes, one dot per poll. A flat line \
+            near the bottom is resting state; a hump that fades is a compile or a \
+            single request; a sustained high line is something doing real work. \
+            Useful for catching "is this project still busy or did it get stuck?"
+            """
+        ),
+        (
+            title: "Verdict labels",
+            body: """
+            The grey or orange text next to a project's name is Harbr's read on \
+            what the project is doing right now:
+
+            • Compiling — recently started, CPU is high. Normal for the first \
+            30–60 seconds.
+            • Idle Nh — log hasn't been written in N hours AND CPU is quiet. \
+            Probably safe to stop if you're not using it.
+            • Climbing — memory's been trending up over the last 10 minutes. \
+            Could be a leak; could just be hot-reload caches.
+            • Heavy memory — using more than 2 GB. Worth knowing about even if \
+            it's behaving.
+            • Hot CPU — sustained high CPU outside the compile window. Often a \
+            runaway or an infinite loop in a watcher.
+            """
+        ),
+        (
+            title: "Health checks",
+            body: """
+            If you set a "Health Check URL" on a project, Harbr hits that URL \
+            every poll and only calls the project healthy if it gets a 2xx \
+            response. A green dot in the status column means the port is open \
+            AND the health URL is happy; a yellow dot means the port is open \
+            but the health URL is failing — usually the server has started but \
+            isn't actually serving requests yet (or it's crashed in-place).
+            """
+        ),
+        (
+            title: "Docker projects",
+            body: """
+            When a project's port is held by a Docker container, normal \
+            process-level tools see only the Docker proxy — which reads as ~0% \
+            CPU and a few hundred KB of memory regardless of what's actually \
+            running. Harbr detects that case and asks Docker directly for the \
+            container's real CPU and memory numbers. No setup required: if you \
+            have Docker Desktop and a container publishing the project's port, \
+            Harbr just shows the right numbers automatically.
+            """
+        ),
+        (
+            title: "Auto-restart",
+            body: """
+            If you tick "Auto-restart" on a project, Harbr will respawn it when \
+            the port goes down — but only within 30 seconds of the last \
+            Harbr-initiated start, and only up to 3 times in a row. The window \
+            limit means a project you've been running for an hour and then shut \
+            down on purpose (e.g. `docker compose down` from another terminal) \
+            won't get resurrected. The retry cap prevents an endless cascade if \
+            the server is failing to bind for a real reason.
+            """
+        )
+    ]
+
+    @MainActor private func buildHelpTab(in container: NSView) {
+        let bounds = container.bounds
+
+        let title = NSTextField(labelWithString: "Help")
+        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        title.frame = NSRect(x: 20, y: bounds.height - 44, width: 200, height: 28)
+        title.autoresizingMask = [.minYMargin]
+        container.addSubview(title)
+
+        let hint = NSTextField(labelWithString: "Short explanations of the terms Harbr uses. No jargon.")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: 20, y: bounds.height - 64, width: 500, height: 16)
+        hint.autoresizingMask = [.minYMargin]
+        container.addSubview(hint)
+
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 20, width: bounds.width - 40, height: bounds.height - 100))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .lineBorder
+        scroll.autoresizingMask = [.width, .height]
+        scroll.drawsBackground = true
+        scroll.backgroundColor = .controlBackgroundColor
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 22
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 28, bottom: 24, right: 28)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let documentView = FlippedView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
+        ])
+
+        let insetSum = stack.edgeInsets.left + stack.edgeInsets.right
+        for section in Self.helpSections {
+            let row = buildHelpSection(title: section.title, body: section.body)
+            stack.addArrangedSubview(row)
+            // NSStackView's .leading alignment doesn't stretch arranged
+            // subviews to fill the cross-axis — they collapse to intrinsic
+            // width, which for a wrapping label is the longest unbroken
+            // line on one row. Force each row to span the stack so the
+            // body actually wraps within the visible area.
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -insetSum).isActive = true
+        }
+
+        scroll.documentView = documentView
+        // Pin the document view's width to the scroll view's content area so
+        // wrapping labels can compute their height correctly — without this
+        // the stack expands horizontally to fit the longest line on one row.
+        NSLayoutConstraint.activate([
+            documentView.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+        ])
+        container.addSubview(scroll)
+    }
+
+    @MainActor private func buildHelpSection(title: String, body: String) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let heading = NSTextField(labelWithString: title)
+        heading.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        heading.textColor = .labelColor
+        heading.translatesAutoresizingMaskIntoConstraints = false
+
+        let bodyField = NSTextField(wrappingLabelWithString: body)
+        bodyField.font = NSFont.systemFont(ofSize: 12)
+        bodyField.textColor = .secondaryLabelColor
+        bodyField.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(heading)
+        row.addSubview(bodyField)
+
+        NSLayoutConstraint.activate([
+            heading.topAnchor.constraint(equalTo: row.topAnchor),
+            heading.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            heading.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+
+            bodyField.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 6),
+            bodyField.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            bodyField.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            bodyField.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+        ])
+
+        return row
     }
 
     // MARK: Settings tab
