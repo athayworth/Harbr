@@ -15,6 +15,19 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Added
 
+- Foreign-process detection on the project rows. When a port is held
+  by a process whose executable name doesn't plausibly match the
+  project's `startCommand` (e.g. a stray Streamlit on a port
+  configured for a Next.js project), the status dot turns yellow and
+  the tooltip names the actual command. Docker-backed ports are
+  exempt — any container publishing the port is assumed to be the
+  user's. Lives in `HarbrApp.processMatchesStartCommand` and
+  `HarbrApp.foreignCommandIfMismatch`, with a small lookup table of
+  launcher → expected process for common toolchains (npm/pnpm/yarn
+  → node, streamlit/uvicorn → python, etc.). The detail sheet's
+  verdict line also flips to "Port held by X — not your project" so
+  CPU/memory stats from someone else's process can't be misread as
+  the user's project.
 - Help tab in the desktop window. New fourth sidebar item with short,
   plain-language explanations of the terms Harbr surfaces in its UI —
   Port, CPU%, Memory (RAM), macOS memory pressure, trend sparklines,

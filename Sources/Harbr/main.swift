@@ -1310,12 +1310,23 @@ class ProjectDetailWindow: NSObject, NSWindowDelegate {
         let active = status?.isActive ?? false
 
         let symbol: String = active ? "circle.fill" : "circle"
+        let foreign = status?.foreignProcessCommand
+        let warning = active && (status?.healthStatus == false || foreign != nil)
         statusDot?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: active ? "Running" : "Stopped")
-        statusDot?.contentTintColor = active
-            ? (status?.healthStatus == false ? .systemYellow : .systemGreen)
-            : .tertiaryLabelColor
+        statusDot?.contentTintColor = warning
+            ? .systemYellow
+            : (active ? .systemGreen : .tertiaryLabelColor)
+        statusDot?.toolTip = foreign.map { "Port held by \($0), not your project's start command." }
 
-        if let v = app.verdict(for: project) {
+        if let foreign {
+            // Foreign-process state is more urgent than the regular verdicts —
+            // if the port is held by something unexpected, none of the
+            // CPU/memory/uptime stats on this sheet are about the user's
+            // actual project. Surface it prominently so they don't read
+            // someone else's stats as their own.
+            verdictLabel?.stringValue = "Port held by \(foreign) — not your project."
+            verdictLabel?.textColor = .systemOrange
+        } else if let v = app.verdict(for: project) {
             verdictLabel?.stringValue = v.displayText
             verdictLabel?.textColor = v.isAttention ? .systemOrange : .secondaryLabelColor
         } else {
@@ -1551,10 +1562,17 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             guard let project = app?.config?.projects[safe: row] else { return nil }
             let cell = NSTableCellView()
             let dot = NSImageView(frame: NSRect(x: 6, y: 7, width: 12, height: 12))
-            let active = app?.portStatusCache[project.port]?.isActive ?? false
+            let status = app?.portStatusCache[project.port]
+            let active = status?.isActive ?? false
+            let warning = active && (status?.healthStatus == false || status?.foreignProcessCommand != nil)
             dot.image = NSImage(systemSymbolName: active ? "circle.fill" : "circle",
                                 accessibilityDescription: active ? "Running" : "Stopped")
-            dot.contentTintColor = active ? .systemGreen : .tertiaryLabelColor
+            dot.contentTintColor = warning ? .systemYellow
+                                  : active ? .systemGreen
+                                  : .tertiaryLabelColor
+            if let foreign = status?.foreignProcessCommand {
+                dot.toolTip = "Port held by \(foreign), not your project's start command."
+            }
             cell.addSubview(dot)
             let label = NSTextField(labelWithString: "\(project.name)  :\(project.port)")
             label.frame = NSRect(x: 26, y: 4, width: 220, height: 20)
@@ -1721,16 +1739,23 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             let dot = NSImageView(frame: NSRect(x: 4, y: 6, width: 14, height: 14))
             let active = status?.isActive ?? false
             let unhealthy = active && status?.healthStatus == false
+            let foreign = status?.foreignProcessCommand
+            let foreignWarning = active && foreign != nil
             let starting = !active && (app?.isStarting(port: project.port) ?? false)
             let symbol: String = active ? "circle.fill"
                               : starting ? "circle.dotted"
                               : "circle"
             dot.image = NSImage(systemSymbolName: symbol,
                                 accessibilityDescription: starting ? "Starting" : (active ? "Running" : "Stopped"))
-            dot.contentTintColor = unhealthy ? .systemYellow
+            dot.contentTintColor = (unhealthy || foreignWarning) ? .systemYellow
                                   : active ? .systemGreen
                                   : starting ? .controlAccentColor
                                   : .tertiaryLabelColor
+            if let foreign {
+                dot.toolTip = "Port \(project.port) is held by \(foreign), not by what \"\(project.startCommand)\" would spawn. If you didn't start this, another app is using the port."
+            } else if unhealthy {
+                dot.toolTip = "Port is open but the project's health check is failing."
+            }
             cell.addSubview(dot)
         case "name":
             // Inline verdict suffix — appears after the name when the
@@ -2156,6 +2181,19 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             it's behaving.
             • Hot CPU — sustained high CPU outside the compile window. Often a \
             runaway or an infinite loop in a watcher.
+            """
+        ),
+        (
+            title: "Yellow status dot",
+            body: """
+            A yellow dot means the port IS open, but something looks off. Two \
+            things trigger it: (1) you set a Health Check URL and the server's \
+            not returning 2xx yet — usually it's mid-startup, sometimes it has \
+            silently crashed in place; or (2) the process holding the port \
+            doesn't match what your project's start command would spawn. The \
+            second case usually means a different app on your Mac grabbed the \
+            port first (a stray Streamlit app on 8501 is a classic). Hover the \
+            dot for the specific reason.
             """
         ),
         (
@@ -2987,6 +3025,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cpuUsage: Double?
         let memoryUsage: Double?
         let healthStatus: Bool? // nil = no health check, true = healthy, false = unhealthy
+        /// Non-nil when the port is active but the process holding it doesn't
+        /// look like what the project's startCommand would spawn — e.g. a
+        /// stray Streamlit instance grabbed a port that this Harbr project
+        /// configured for a Next.js dev server. Value is a human-readable
+        /// list of the foreign command names, suitable for a status-dot
+        /// tooltip. Docker-backed ports are never considered foreign.
+        let foreignProcessCommand: String?
     }
 
     /// Cache for port status to avoid blocking the menu on each open.
@@ -3060,7 +3105,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return isHealthy
     }
 
-    func getResourceUsage(for port: Int) -> (cpu: Double, mem: Double)? {
+    func getResourceUsage(for port: Int) -> (cpu: Double, mem: Double, commands: [String])? {
         // Get PIDs for the port. SafeProcess returns nil on launch failure
         // or ObjC exception (e.g. fork() failing under memory pressure).
         // Flags: -n (no DNS), -P (no port-name lookup), -b (avoid blocking
@@ -3082,33 +3127,87 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pids = pidOutput.components(separatedBy: "\n").filter { !$0.isEmpty }
         guard !pids.isEmpty else { return nil }
 
-        // Get resource usage for all PIDs in one ps call. rss is the resident
-        // set size in KB — same number Activity Monitor labels "Real Memory"
-        // — which formats much more legibly as MB/GB than the old %mem
-        // (fraction-of-total-RAM) figure. Vibe coders parse "1.2 GB" as a
-        // problem; "3.4%" reads as fine even when it isn't.
+        // Get resource usage + command name for all PIDs in one ps call.
+        // rss is the resident set size in KB — same number Activity Monitor
+        // labels "Real Memory" — which formats much more legibly as MB/GB
+        // than the old %mem (fraction-of-total-RAM) figure. comm is the
+        // executable basename (e.g. "node", "python3"); we use it for the
+        // foreign-process check so a stray Streamlit on a port that's
+        // configured for a Next.js project can be flagged as "not yours."
         guard let psResult = SafeProcess.runCapturingOutput(
             launchPath: "/bin/ps",
-            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu,rss"]
+            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu=,rss=,comm="]
         ) else { return nil }
 
         var totalCpu: Double = 0
         var totalMemMB: Double = 0
+        var commands: Set<String> = []
 
         let lines = psResult.stdout.components(separatedBy: "\n")
-        for line in lines.dropFirst() { // Skip header
+        for line in lines {
             let values = line.trimmingCharacters(in: .whitespaces)
                 .components(separatedBy: CharacterSet.whitespaces)
                 .filter { !$0.isEmpty }
-            if values.count >= 2 {
+            if values.count >= 3 {
                 totalCpu += Double(values[0]) ?? 0
-                // rss is in KB → MB; keep as Double so formatMemory can
-                // promote to GB at display time.
                 totalMemMB += (Double(values[1]) ?? 0) / 1024.0
+                // comm comes back as an executable path on macOS in some
+                // configurations (full /Users/.../node) — basename it so
+                // the matcher and the tooltip read cleanly.
+                let comm = (values[2] as NSString).lastPathComponent
+                if !comm.isEmpty { commands.insert(comm) }
             }
         }
 
-        return (totalCpu, totalMemMB)
+        return (totalCpu, totalMemMB, commands.sorted())
+    }
+
+    /// Maps a process executable name to known launcher/wrapper commands
+    /// that spawn it. Used by `processMatchesStartCommand` so a project
+    /// with `startCommand = "pnpm dev"` doesn't get flagged "foreign" just
+    /// because the actual port-holder is `node`. The list is intentionally
+    /// conservative — false-positive matches (saying "this is yours" when
+    /// it isn't) are worse than false-negative (yellow dot on a legit
+    /// project, with a tooltip the user can read).
+    private static let knownLauncherCommands: [String: [String]] = [
+        "node": ["npm", "pnpm", "yarn", "bun", "next", "vite", "nuxt", "astro", "remix", "deno", "tsx", "ts-node", "nodemon", "turbo", "esbuild", "webpack"],
+        "python": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry"],
+        "python3": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry"],
+        "ruby": ["rails", "sinatra", "puma", "unicorn", "bundle"],
+        "java": ["mvn", "gradle", "maven", "spring"],
+        "beam.smp": ["mix", "iex", "elixir", "phoenix"]
+    ]
+
+    /// True when `processCmd` plausibly came from `startCommand` — either
+    /// the process name appears literally in the start command, the
+    /// hyphen-squashed form matches (so "next-dev" reads against "next dev"),
+    /// or the start command uses a known launcher for this kind of process.
+    static func processMatchesStartCommand(processCmd: String, startCommand: String) -> Bool {
+        let cmd = processCmd.lowercased()
+        let start = startCommand.lowercased()
+        if cmd.isEmpty || start.isEmpty { return true }
+        if start.contains(cmd) { return true }
+        let cmdSquashed = cmd.replacingOccurrences(of: "-", with: "")
+        let startSquashed = start
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        if startSquashed.contains(cmdSquashed) { return true }
+        if let wrappers = knownLauncherCommands[cmd] {
+            for wrapper in wrappers {
+                if start.contains(wrapper) { return true }
+            }
+        }
+        return false
+    }
+
+    /// Returns the foreign-process tooltip string if the port's commands
+    /// look unrelated to the project's startCommand, or nil when they
+    /// plausibly match (or we don't have enough info to judge).
+    static func foreignCommandIfMismatch(commands: [String], startCommand: String) -> String? {
+        if commands.isEmpty { return nil }
+        let anyMatch = commands.contains { processMatchesStartCommand(processCmd: $0, startCommand: startCommand) }
+        if anyMatch { return nil }
+        return commands.joined(separator: ", ")
     }
 
     /// Format an MB-valued double as "247 MB" or "1.4 GB", picking the unit
@@ -3152,21 +3251,35 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let isActive = self?.isPortActive(project.port) ?? false
                 var cpu: Double? = nil
                 var mem: Double? = nil
+                var foreign: String? = nil
 
                 if isActive {
                     if let docker = dockerSamples[project.port] {
                         // Prefer Docker's view because PS would only see
                         // the proxy process, which reads as ~0% CPU and a
-                        // few hundred KB regardless of real load.
+                        // few hundred KB regardless of real load. Docker is
+                        // intentionally considered "matching" — we trust
+                        // any container publishing the port is what the
+                        // user meant by their startCommand.
                         cpu = docker.cpu
                         mem = docker.memMB
                     } else if let usage = self?.getResourceUsage(for: project.port) {
                         cpu = usage.cpu
                         mem = usage.mem
+                        foreign = HarbrApp.foreignCommandIfMismatch(
+                            commands: usage.commands,
+                            startCommand: project.startCommand
+                        )
                     }
                 }
 
-                newCache[project.port] = PortStatus(isActive: isActive, cpuUsage: cpu, memoryUsage: mem, healthStatus: nil)
+                newCache[project.port] = PortStatus(
+                    isActive: isActive,
+                    cpuUsage: cpu,
+                    memoryUsage: mem,
+                    healthStatus: nil,
+                    foreignProcessCommand: foreign
+                )
 
                 // Check for state change using captured snapshot
                 if let previousState = capturedPreviousStates[project.port],
@@ -3210,7 +3323,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     isActive: status.isActive,
                     cpuUsage: status.cpuUsage,
                     memoryUsage: status.memoryUsage,
-                    healthStatus: healthy
+                    healthStatus: healthy,
+                    foreignProcessCommand: status.foreignProcessCommand
                 )
             }
 
@@ -3708,7 +3822,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
-        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil)
+        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil, foreignProcessCommand: nil)
         let title = "\(project.name)  :\(project.port)"
         let starting = isStarting(port: project.port)
 
@@ -4051,7 +4165,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isActive: false,
             cpuUsage: nil,
             memoryUsage: nil,
-            healthStatus: nil
+            healthStatus: nil,
+            foreignProcessCommand: nil
         )
         previousPortStates[port] = false
         rebuildMenu()
@@ -4118,7 +4233,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         isActive: true,
                         cpuUsage: nil,
                         memoryUsage: nil,
-                        healthStatus: nil
+                        healthStatus: nil,
+                        foreignProcessCommand: nil
                     )
                     self.previousPortStates[port] = true
                     // Only surface a notification for user-initiated stops.
