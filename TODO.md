@@ -89,6 +89,16 @@ work is what's left.
 
 ## P1 — polish that closes the "feels paid" gap
 
+- [x] **In-app Help tab for non-technical users.** Shipped 2026-06-06
+  as a fourth sidebar tab on the desktop window, with short
+  plain-language explanations of every term Harbr surfaces (Port,
+  CPU%, Memory, macOS memory pressure, trend sparkline, the five
+  verdict labels, health checks, Docker stats, auto-restart). Content
+  lives in `HarbrMainWindow.helpSections` next to the verdict engine
+  so wording stays in sync as labels evolve. Built for vibe coders
+  who ship features with an LLM but haven't memorized what "memory
+  pressure" formally means.
+
 - [x] **Per-project detail view with bigger CPU + memory charts.**
   Shipped 2026-06-05 as `ProjectDetailWindow`, opened as a sheet
   from the Projects table's double-click handler. CPU sparkline

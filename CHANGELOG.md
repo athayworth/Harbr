@@ -15,6 +15,14 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Added
 
+- Help tab in the desktop window. New fourth sidebar item with short,
+  plain-language explanations of the terms Harbr surfaces in its UI —
+  Port, CPU%, Memory (RAM), macOS memory pressure, trend sparklines,
+  the verdict labels (compiling / idle / climbing / heavy memory / hot
+  CPU), health checks, Docker stats, and auto-restart. Content lives
+  next to the code that produces those terms (`HarbrMainWindow.helpSections`)
+  so the wording is one screen away from the verdict engine that
+  generates the labels.
 - Sparkle 2.x scaffolding for in-app auto-updates. `Package.swift`
   pulls Sparkle; `UpdateManager` initializes
   `SPUStandardUpdaterController` only when Info.plist's
@@ -75,6 +83,12 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- App failed to launch after Sparkle was added: SwiftPM emits an
+  `@executable_path` rpath that doesn't reach `/Contents/Frameworks/`,
+  so dyld couldn't resolve Sparkle.framework. `install.sh` and
+  `notarize.sh` now embed Sparkle.framework into `/Contents/Frameworks/`
+  via `ditto` and rewrite the rpath via `install_name_tool
+  -add_rpath @executable_path/../Frameworks` before codesigning.
 - Duplicate Harbr instances at login. `LSMultipleInstancesProhibited`
   is now set in `Info.plist`, so even if both Harbr's own LaunchAgent
   and a stale SMAppService login item fire at login, macOS refuses
