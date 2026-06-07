@@ -1493,6 +1493,14 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         self.window = window
 
         guard let content = window.contentView else { return }
+        // setFrameUsingName may have resized the window above to a saved
+        // frame larger than the default contentRect. AppKit's autoresizing
+        // mask only fires on SUBSEQUENT superview resizes — so subviews
+        // added now with hardcoded smaller frames stay small until the
+        // user nudges the window. Capture the current content bounds and
+        // size each child to it, so the layout fills the window the
+        // moment it opens.
+        let contentSize = content.bounds.size
 
         // Sidebar. Use NSVisualEffectView with the system .sidebar material
         // so it picks up the correct vibrancy + auto-adapts to light/dark
@@ -1501,7 +1509,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         // which doesn't track appearance changes — switching the Mac to
         // dark mode left the sidebar stuck white.
         let sidebarWidth: CGFloat = 180
-        let sidebarContainer = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: 560))
+        let sidebarContainer = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sidebarWidth, height: contentSize.height))
         sidebarContainer.material = .sidebar
         sidebarContainer.blendingMode = .behindWindow
         sidebarContainer.state = .active
@@ -1533,13 +1541,18 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         }
 
         // Divider
-        let divider = NSBox(frame: NSRect(x: sidebarWidth, y: 0, width: 1, height: 560))
+        let divider = NSBox(frame: NSRect(x: sidebarWidth, y: 0, width: 1, height: contentSize.height))
         divider.boxType = .separator
         divider.autoresizingMask = [.height]
         content.addSubview(divider)
 
         // Content container
-        let container = NSView(frame: NSRect(x: sidebarWidth + 1, y: 0, width: 880 - sidebarWidth - 1, height: 560))
+        let container = NSView(frame: NSRect(
+            x: sidebarWidth + 1,
+            y: 0,
+            width: max(0, contentSize.width - sidebarWidth - 1),
+            height: contentSize.height
+        ))
         container.autoresizingMask = [.height, .width]
         content.addSubview(container)
         self.contentContainer = container
@@ -1818,25 +1831,11 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             }
             cell.addSubview(label)
         case "framework":
-            // Best-effort: re-parse package.json once per row build. Cheap
-            // because it's only the rows currently scrolled into view.
-            let pkgPath = (project.directory as NSString).appendingPathComponent("package.json")
-            var framework = "—"
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: pkgPath)),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let deps = (json["dependencies"] as? [String: Any]) ?? [:]
-                let devDeps = (json["devDependencies"] as? [String: Any]) ?? [:]
-                let allDeps = Set(deps.keys).union(devDeps.keys)
-                if allDeps.contains("next") { framework = "Next.js" }
-                else if allDeps.contains("vite") { framework = "Vite" }
-                else if allDeps.contains("astro") { framework = "Astro" }
-                else if allDeps.contains("@sveltejs/kit") { framework = "SvelteKit" }
-                else if allDeps.contains("nuxt") { framework = "Nuxt" }
-                else if allDeps.contains("remix") || allDeps.contains("@remix-run/dev") { framework = "Remix" }
-                else if allDeps.contains("react-scripts") { framework = "CRA" }
-                else if allDeps.contains("express") { framework = "Express" }
-                else if allDeps.contains("fastify") { framework = "Fastify" }
-            }
+            // Best-effort detection per row build. The helper short-circuits
+            // on the first manifest that exists, so a stat() miss for
+            // package.json / requirements.txt / Gemfile / etc. is the only
+            // cost when the project's stack doesn't match any of them.
+            let framework = HarbrApp.detectFramework(for: project)
             let label = NSTextField(labelWithString: framework)
             label.frame = NSRect(x: 0, y: 4, width: 100, height: 20)
             label.textColor = .secondaryLabelColor
@@ -3170,12 +3169,16 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// it isn't) are worse than false-negative (yellow dot on a legit
     /// project, with a tooltip the user can read).
     private static let knownLauncherCommands: [String: [String]] = [
-        "node": ["npm", "pnpm", "yarn", "bun", "next", "vite", "nuxt", "astro", "remix", "deno", "tsx", "ts-node", "nodemon", "turbo", "esbuild", "webpack"],
-        "python": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry"],
-        "python3": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry"],
-        "ruby": ["rails", "sinatra", "puma", "unicorn", "bundle"],
+        "node": ["npm", "pnpm", "yarn", "bun", "next", "vite", "nuxt", "astro", "remix", "deno", "tsx", "ts-node", "nodemon", "turbo", "esbuild", "webpack", "concurrently", "wrangler", "rollup", "parcel"],
+        "python": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry", "manage.py", "scrapy", "celery", "pipenv"],
+        "python3": ["streamlit", "gunicorn", "uvicorn", "flask", "fastapi", "jupyter", "uv ", "poetry", "manage.py", "scrapy", "celery", "pipenv"],
+        "ruby": ["rails", "sinatra", "puma", "unicorn", "bundle", "rake", "rackup", "thin"],
         "java": ["mvn", "gradle", "maven", "spring"],
-        "beam.smp": ["mix", "iex", "elixir", "phoenix"]
+        "beam.smp": ["mix", "iex", "elixir", "phoenix"],
+        "php": ["artisan", "symfony", "composer", "twill"],
+        "php-fpm": ["artisan", "symfony", "twill"],
+        "go": ["go run", "air"],
+        "cargo": ["cargo run"]
     ]
 
     /// True when `processCmd` plausibly came from `startCommand` — either
@@ -3208,6 +3211,105 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let anyMatch = commands.contains { processMatchesStartCommand(processCmd: $0, startCommand: startCommand) }
         if anyMatch { return nil }
         return commands.joined(separator: ", ")
+    }
+
+    /// Best-effort framework label for the Type column. Checks the project
+    /// directory for ecosystem manifests in order — package.json, then
+    /// Python, Ruby, Elixir/Go/Rust — and finally falls back to scanning
+    /// the start command for known launcher names. Returns "—" if nothing
+    /// looks familiar. Cheap enough to call per visible row because each
+    /// branch short-circuits on the first file that exists, and a missing
+    /// file is a single stat() call.
+    static func detectFramework(for project: Project) -> String {
+        let directory = project.directory
+        if let js = detectJSFramework(directory: directory) { return js }
+        if let py = detectPythonFramework(directory: directory) { return py }
+        if let rb = detectRubyFramework(directory: directory) { return rb }
+        if let other = detectOtherFramework(directory: directory) { return other }
+        if let fromCommand = detectFromStartCommand(project.startCommand) { return fromCommand }
+        return "—"
+    }
+
+    private static func detectJSFramework(directory: String) -> String? {
+        let pkgPath = (directory as NSString).appendingPathComponent("package.json")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: pkgPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let deps = (json["dependencies"] as? [String: Any]) ?? [:]
+        let devDeps = (json["devDependencies"] as? [String: Any]) ?? [:]
+        let allDeps = Set(deps.keys).union(devDeps.keys)
+        if allDeps.contains("next") { return "Next.js" }
+        if allDeps.contains("vite") { return "Vite" }
+        if allDeps.contains("astro") { return "Astro" }
+        if allDeps.contains("@sveltejs/kit") { return "SvelteKit" }
+        if allDeps.contains("nuxt") { return "Nuxt" }
+        if allDeps.contains("remix") || allDeps.contains("@remix-run/dev") { return "Remix" }
+        if allDeps.contains("react-scripts") { return "CRA" }
+        if allDeps.contains("express") { return "Express" }
+        if allDeps.contains("fastify") { return "Fastify" }
+        return nil
+    }
+
+    private static func detectPythonFramework(directory: String) -> String? {
+        // requirements.txt is the most common in vibe-coder land; pyproject
+        // (uv, poetry) is rising but still secondary. Lowercase compare so
+        // versioned pins like `Streamlit==1.34` still match.
+        let candidates = ["requirements.txt", "pyproject.toml", "Pipfile"]
+        for name in candidates {
+            let path = (directory as NSString).appendingPathComponent(name)
+            guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            let text = raw.lowercased()
+            if text.contains("streamlit") { return "Streamlit" }
+            if text.contains("django") { return "Django" }
+            if text.contains("fastapi") { return "FastAPI" }
+            if text.contains("flask") { return "Flask" }
+        }
+        return nil
+    }
+
+    private static func detectRubyFramework(directory: String) -> String? {
+        let gemfilePath = (directory as NSString).appendingPathComponent("Gemfile")
+        guard let raw = try? String(contentsOfFile: gemfilePath, encoding: .utf8) else { return nil }
+        let text = raw.lowercased()
+        // Match the gem name as a token between quotes so a comment that
+        // happens to mention "rails" doesn't trigger a false positive.
+        if text.contains("'rails'") || text.contains("\"rails\"") { return "Rails" }
+        if text.contains("'sinatra'") || text.contains("\"sinatra\"") { return "Sinatra" }
+        return nil
+    }
+
+    private static func detectOtherFramework(directory: String) -> String? {
+        let fm = FileManager.default
+        let mixPath = (directory as NSString).appendingPathComponent("mix.exs")
+        if fm.fileExists(atPath: mixPath) {
+            if let raw = try? String(contentsOfFile: mixPath, encoding: .utf8),
+               raw.lowercased().contains("phoenix") {
+                return "Phoenix"
+            }
+            return "Elixir"
+        }
+        if fm.fileExists(atPath: (directory as NSString).appendingPathComponent("Cargo.toml")) {
+            return "Rust"
+        }
+        if fm.fileExists(atPath: (directory as NSString).appendingPathComponent("go.mod")) {
+            return "Go"
+        }
+        return nil
+    }
+
+    private static func detectFromStartCommand(_ command: String) -> String? {
+        let lower = command.lowercased()
+        if lower.contains("streamlit") { return "Streamlit" }
+        if lower.contains("uvicorn") { return "Uvicorn" }
+        if lower.contains("gunicorn") { return "Gunicorn" }
+        if lower.contains("flask") { return "Flask" }
+        if lower.contains("django") { return "Django" }
+        if lower.contains("rails") { return "Rails" }
+        if lower.contains("mix phx") { return "Phoenix" }
+        if lower.contains("cargo run") { return "Rust" }
+        if lower.contains("go run") || lower.range(of: #"\bair\b"#, options: .regularExpression) != nil { return "Go" }
+        return nil
     }
 
     /// Format an MB-valued double as "247 MB" or "1.4 GB", picking the unit
@@ -3904,6 +4006,14 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 statusColor = .systemYellow
                 statusSymbol = "exclamationmark.circle.fill"
                 statusDescription = "Unhealthy"
+            } else if status.foreignProcessCommand != nil {
+                // Port is open but held by something that doesn't look like
+                // what this project would spawn. Mirror the Projects-tab and
+                // Activity-tab dot semantics here so the menu bar dropdown
+                // doesn't disagree with the desktop window.
+                statusColor = .systemYellow
+                statusSymbol = "exclamationmark.circle.fill"
+                statusDescription = "Foreign"
             } else {
                 // Running and healthy (or no health check)
                 statusColor = .systemGreen
