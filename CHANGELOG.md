@@ -116,6 +116,14 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Expanded the Help tab's Health Check section into a vibe-coder
+  friendly explainer: what a health check IS, why a yellow dot
+  appears on an otherwise-running project, and the most common
+  cause (a stale URL inherited from another project). Added a
+  tooltip on the Health Check label + field in the Add/Edit
+  Project window with the same explanation, and updated the
+  placeholder text to nudge people to leave it empty if they
+  don't know what to put there.
 - Docker-backed projects (Supabase, Postgres, anything else
   proxied by Docker Desktop) showed yellow "foreign" whenever
   Docker's per-poll port map was unavailable — usually because the
