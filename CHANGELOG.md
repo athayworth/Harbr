@@ -15,6 +15,26 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Added
 
+- Framework detector extended beyond Node.js. The Type column now
+  recognizes Streamlit, FastAPI, Flask, Django (via
+  requirements.txt / pyproject.toml / Pipfile), Rails, Sinatra
+  (Gemfile), Phoenix, Elixir (mix.exs), Rust (Cargo.toml), and Go
+  (go.mod). When no manifest matches, falls back to scanning the
+  project's startCommand for launcher names (streamlit, uvicorn,
+  rails, mix phx, cargo run, go run, etc.). Shared helper
+  `HarbrApp.detectFramework(for:)` replaces the inline package.json
+  parse in the table cell.
+- Menu bar dropdown now shows yellow + "Foreign" for projects whose
+  port is held by a process that doesn't match the start command,
+  matching the Projects-tab and Activity-tab dot semantics. Previously
+  the dropdown row stayed green even when the desktop window showed
+  yellow, which made the two surfaces disagree.
+- Foreign-process matcher extended with more launcher coverage —
+  added PHP/Laravel (`artisan`, `symfony`, `twill`), Go (`go run`,
+  `air`), Rust (`cargo run`), and more Node wrappers (`concurrently`,
+  `wrangler`, `rollup`, `parcel`) plus Python helpers
+  (`pipenv`, `manage.py`, `scrapy`, `celery`). Cuts false-positive
+  yellow dots on common stacks the v1 lookup table missed.
 - Foreign-process detection on the project rows. When a port is held
   by a process whose executable name doesn't plausibly match the
   project's `startCommand` (e.g. a stray Streamlit on a port
@@ -96,6 +116,18 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Desktop window left a wide strip of empty white space on the right
+  when opened at a saved frame larger than the default contentRect.
+  The sidebar, divider, and content container were created with
+  hardcoded smaller frames; AppKit's autoresizing only fires on
+  subsequent superview resizes, so the children never caught up to
+  the restored window size until the user nudged the edge.
+  `buildWindow` now seeds each child to `content.bounds` at creation
+  so the layout fills the window on first open. Fixes the Activity
+  log panel cutting off mid-screen and the Help-tab scroll view
+  ending early; Projects table's column-autoresizing fix from the
+  prior commit relied on the container being sized correctly to
+  begin with.
 - App failed to launch after Sparkle was added: SwiftPM emits an
   `@executable_path` rpath that doesn't reach `/Contents/Frameworks/`,
   so dyld couldn't resolve Sparkle.framework. `install.sh` and
