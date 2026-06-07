@@ -116,6 +116,18 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Projects all showing as "stopped" even when actually running, on
+  systems under memory pressure or with Docker Desktop hung. Three
+  cascading causes: (1) `docker ps` blocking 2s every poll, (2) the
+  default 10s `ps` timeout letting one slow process eat two whole
+  poll cycles, and (3) the `pollGeneration` stale-result guard
+  silently throwing away every late poll's data instead of just the
+  state-change side-effects. Now `DockerStats` skips Docker entirely
+  for 60s after 2 consecutive timeouts (with shorter 1s/2s
+  timeouts), `getResourceUsage` caps `ps` at 3s, and the poll
+  commits its cache update even when stale — only notifications and
+  auto-restart honor the guard, since those are sensitive to a user
+  stop/start having superseded the in-flight poll.
 - Desktop window left a wide strip of empty white space on the right
   when opened at a saved frame larger than the default contentRect.
   The sidebar, divider, and content container were created with

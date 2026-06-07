@@ -3133,9 +3133,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // executable basename (e.g. "node", "python3"); we use it for the
         // foreign-process check so a stray Streamlit on a port that's
         // configured for a Next.js project can be flagged as "not yours."
+        //
+        // 3s timeout matches lsof above. SafeProcess's default 10s is the
+        // wrong order of magnitude here — when the system is thrashing
+        // (memory pressure, disk paging), `ps` can sit for tens of seconds,
+        // and at the 5s poll cadence that means the next poll's
+        // pollGeneration check throws away the stale result every cycle,
+        // freezing the portStatusCache at whatever was last committed.
         guard let psResult = SafeProcess.runCapturingOutput(
             launchPath: "/bin/ps",
-            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu=,rss=,comm="]
+            arguments: ["-p", pids.joined(separator: ","), "-o", "%cpu=,rss=,comm="],
+            timeout: 3
         ) else { return nil }
 
         var totalCpu: Double = 0
@@ -3434,25 +3442,34 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
 
                 // Stale-result guard: a newer poll has been scheduled since
-                // this one started, so its result is more recent — drop ours.
-                // This matters when a user-initiated stop schedules a fresh
-                // poll while a 5s timer poll (which may have read the port
-                // as still-active and then blocked for ~5s on health checks)
-                // is still pending. Without this, the older poll commits
-                // last and the toolbar count freezes at the pre-stop value
-                // until the next timer tick.
-                guard myGeneration == self.pollGeneration else { return }
+                // this one started. Previously this dropped the entire
+                // commit — but when the system is slow enough that every
+                // poll exceeds the 5s interval (memory pressure, Docker
+                // hung, ps timing out at 3s × N projects), that drops EVERY
+                // poll and the cache never updates, leaving the UI frozen
+                // at "everything stopped." The cache update itself is the
+                // freshest snapshot we have for each port, so we commit it
+                // unconditionally — only the state-change side effects
+                // (notifications, auto-restart, previous-state tracking)
+                // skip when stale, since those are sensitive to a user
+                // stop/start action having superseded this poll.
+                let isStale = (myGeneration != self.pollGeneration)
 
-                // Update previous states
-                for project in projectsCopy {
-                    self.previousPortStates[project.port] = newCache[project.port]?.isActive ?? false
+                if !isStale {
+                    // Update previous states
+                    for project in projectsCopy {
+                        self.previousPortStates[project.port] = newCache[project.port]?.isActive ?? false
+                    }
                 }
 
                 // Collect projects that need auto-restart
                 var projectsToRestart: [Project] = []
 
-                // Send notifications and handle auto-restart for state changes
-                for change in stateChanges {
+                // Send notifications and handle auto-restart for state
+                // changes — but only when this poll's view of the world is
+                // still current. A stale poll's idea of which ports just
+                // came up / went down is by definition out of date.
+                for change in stateChanges where !isStale {
                     if change.started {
                         self.sendNotification(
                             title: "\(change.project.name) Started",
