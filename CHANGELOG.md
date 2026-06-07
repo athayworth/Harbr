@@ -116,6 +116,14 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Docker-backed projects (Supabase, Postgres, anything else
+  proxied by Docker Desktop) showed yellow "foreign" whenever
+  Docker's per-poll port map was unavailable — usually because the
+  Docker daemon was hung and `DockerStats` had entered its 60s
+  cooldown. The foreign-process matcher now treats a port holder
+  named `com.docker.backend` / `vpnkit` / `docker-proxy` as
+  legitimate regardless of the start command, since asking PS who's
+  on the port can't tell us which container is behind the proxy.
 - Edit / Add Project window opened with a tall band of empty space
   at the top and the Save/Cancel buttons overlapping the bottom
   checkboxes. Two compounding causes: (1) the form's `currentY=238`

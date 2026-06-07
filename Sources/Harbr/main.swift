@@ -3272,9 +3272,30 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// plausibly match (or we don't have enough info to judge).
     static func foreignCommandIfMismatch(commands: [String], startCommand: String) -> String? {
         if commands.isEmpty { return nil }
+        // Docker proxy bypass. When DockerStats is in its post-failure
+        // cooldown the per-poll docker-port map is empty and we don't
+        // know which port maps to which container — but we still see
+        // `com.docker.backend` (or the older `vpnkit`) as the holding
+        // process command via ps. Treating that as foreign would flag
+        // every Docker-backed Harbr project yellow whenever Docker is
+        // slow; instead we trust the proxy and let the next successful
+        // docker ps refill stats.
+        if commands.contains(where: isDockerProxyCommand) { return nil }
         let anyMatch = commands.contains { processMatchesStartCommand(processCmd: $0, startCommand: startCommand) }
         if anyMatch { return nil }
         return commands.joined(separator: ", ")
+    }
+
+    /// Names that lsof + ps surface when Docker Desktop's proxy is the
+    /// process listening on a host port. Conservative list — false
+    /// positives here mean a non-Docker process named like one of these
+    /// gets silently treated as legitimate; the cost is small relative to
+    /// the false-positive flood from missing Docker.
+    private static func isDockerProxyCommand(_ command: String) -> Bool {
+        let lower = command.lowercased()
+        return lower.contains("com.docker.backend")
+            || lower.contains("vpnkit")
+            || lower == "docker-proxy"
     }
 
     /// Best-effort framework label for the Type column. Checks the project
