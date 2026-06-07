@@ -121,8 +121,13 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         self.onSave = onSave
         self.existingEnvVars = project?.envVars
 
+        // Height chosen to actually fit the form: 20 top pad + 6 rows × 36
+        // + 2 checkboxes × 24 + 16 gap before buttons + 32 buttons + 16 bottom
+        // ≈ 348, rounded up to 360 for breathing room. Previous 408 paired
+        // with currentY=238 pushed the capture-logs checkbox to y=−4 (clipped
+        // below the content view) and let the buttons overlap it.
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 408),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 360),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -134,6 +139,11 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         // ARC owns the window's lifetime; without this, AppKit also releases on close,
         // causing a double-free with pending CoreAnimation transform animations.
         window.isReleasedWhenClosed = false
+        // macOS state restoration re-applies the saved frame even on
+        // non-resizable windows, which is what makes the editor open at a
+        // historical taller size with the form clustered at the bottom.
+        // Opt out so each launch uses the fresh contentRect above.
+        window.isRestorable = false
         self.window = window
 
         guard let windowContentView = window.contentView else {
@@ -144,9 +154,11 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
 
         let labelWidth: CGFloat = 110
         let fieldX: CGFloat = 130
-        let fieldWidth: CGFloat = 290
+        let fieldWidth: CGFloat = 340
         let rowHeight: CGFloat = 36
-        var currentY: CGFloat = 238
+        // Start one row's worth of padding below the top so the first label
+        // top sits ~20px below the title bar.
+        var currentY: CGFloat = 320
 
         // Name field
         let nameLabel = NSTextField(labelWithString: "Name")
@@ -288,15 +300,16 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             contentView.addSubview(checkbox)
         }
 
-        // Buttons
-        let cancelButton = NSButton(frame: NSRect(x: 280, y: 16, width: 90, height: 32))
+        // Buttons. Right-anchored: save ends 20px from the right edge,
+        // cancel sits 10px left of save.
+        let cancelButton = NSButton(frame: NSRect(x: 290, y: 16, width: 90, height: 32))
         cancelButton.title = "Cancel"
         cancelButton.bezelStyle = .rounded
         cancelButton.target = self
         cancelButton.action = #selector(cancel)
         contentView.addSubview(cancelButton)
 
-        let saveButton = NSButton(frame: NSRect(x: 376, y: 16, width: 90, height: 32))
+        let saveButton = NSButton(frame: NSRect(x: 390, y: 16, width: 90, height: 32))
         saveButton.title = "Save"
         saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
