@@ -3158,10 +3158,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if values.count >= 3 {
                 totalCpu += Double(values[0]) ?? 0
                 totalMemMB += (Double(values[1]) ?? 0) / 1024.0
-                // comm comes back as an executable path on macOS in some
-                // configurations (full /Users/.../node) — basename it so
-                // the matcher and the tooltip read cleanly.
-                let comm = (values[2] as NSString).lastPathComponent
+                // Many Node frameworks set process.title to brand the
+                // running binary — e.g. Next.js reports
+                // `next-server (v16.1.1)`, which `ps -o comm=` echoes
+                // back verbatim. Joining the remaining tokens (rather
+                // than only reading values[2]) and stripping the
+                // " (version)" suffix gives the matcher the canonical
+                // name (`next-server`) instead of `next-server` plus
+                // a stray `(v16.1.1)`.
+                let joined = values.dropFirst(2).joined(separator: " ")
+                let stripped = joined.components(separatedBy: " (").first ?? joined
+                let comm = (stripped as NSString).lastPathComponent
                 if !comm.isEmpty { commands.insert(comm) }
             }
         }
@@ -3186,7 +3193,31 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         "php": ["artisan", "symfony", "composer", "twill"],
         "php-fpm": ["artisan", "symfony", "twill"],
         "go": ["go run", "air"],
-        "cargo": ["cargo run"]
+        "cargo": ["cargo run"],
+        // Framework-branded process titles. Node frameworks call
+        // `process.title = "next-server"` etc. so `ps -o comm=` reports
+        // the branded name instead of `node`. Map them to the same
+        // wrappers the underlying `node` entry uses so a vanilla
+        // `npm run dev` startCommand matches when the holding process
+        // is `next-server`, `vite`, `nuxt-server`, etc.
+        "next-server": ["npm", "pnpm", "yarn", "bun", "next", "turbo", "dev"],
+        "next": ["npm", "pnpm", "yarn", "bun", "next", "turbo", "dev"],
+        "vite": ["npm", "pnpm", "yarn", "bun", "vite", "dev"],
+        "nuxt": ["npm", "pnpm", "yarn", "nuxt", "dev"],
+        "nuxt-server": ["npm", "pnpm", "yarn", "nuxt", "dev"],
+        "astro": ["npm", "pnpm", "yarn", "astro", "dev"],
+        "remix-serve": ["npm", "pnpm", "yarn", "remix", "dev"],
+        // Python framework process names — `streamlit run` becomes a
+        // `python` process with a streamlit-related title in some
+        // setups.
+        "streamlit": ["streamlit", "python", "uv"],
+        "uvicorn": ["uvicorn", "python", "uv"],
+        "gunicorn": ["gunicorn", "python"],
+        // Ruby
+        "rails": ["rails", "bundle"],
+        "puma": ["rails", "bundle", "puma"],
+        // Elixir / Phoenix
+        "phoenix": ["mix", "phx", "phoenix"]
     ]
 
     /// True when `processCmd` plausibly came from `startCommand` — either
@@ -3204,6 +3235,18 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .replacingOccurrences(of: "-", with: "")
         if startSquashed.contains(cmdSquashed) { return true }
         if let wrappers = knownLauncherCommands[cmd] {
+            for wrapper in wrappers {
+                if start.contains(wrapper) { return true }
+            }
+        }
+        // Contains-fallback: when the process name embeds a known runtime
+        // or framework as a substring (`python3.11` contains `python`,
+        // `next-server-dev` contains `next`, `nuxt-server` contains `nuxt`),
+        // use the embedded base's wrappers. Catches version-suffixed
+        // binaries and brand variations we don't have an explicit entry
+        // for. We skip the exact-equal case since the literal lookup above
+        // already handled it.
+        for (base, wrappers) in knownLauncherCommands where cmd != base && cmd.contains(base) {
             for wrapper in wrappers {
                 if start.contains(wrapper) { return true }
             }
