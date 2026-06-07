@@ -39,13 +39,36 @@ enum DockerStats {
 
     /// Returns CPU + memory samples keyed by the host port the container
     /// publishes them on. Empty map if Docker is unavailable, the daemon
-    /// is down, or no containers publish ports.
+    /// is down, no containers publish ports, OR we've recently seen Docker
+    /// time out and are in cooldown.
     static func samplesByHostPort() -> [Int: Sample] {
-        let portMap = portToContainerMap()
+        // Cooldown: when Docker Desktop hangs (memory pressure, restart,
+        // daemon stall), every `docker ps` call sits at the 1s timeout
+        // before failing. Across a 12-project config that already eats
+        // 1s of the 5s poll budget every cycle, and consecutive failures
+        // mean Harbr never gets to commit a fresh portStatusCache update
+        // because the next poll's pollGeneration check discards the in-
+        // flight one. Skipping Docker entirely for cooldownDuration after
+        // consecutiveFailures hits the threshold lets the PS-based path
+        // keep producing live state until Docker comes back.
+        if Date() < cooldownUntil { return [:] }
+
+        guard let portMap = portToContainerMap() else {
+            recordFailure()
+            return [:]
+        }
+        recordSuccess()
         if portMap.isEmpty { return [:] }
+
         let uniqueContainers = Array(Set(portMap.values))
-        let containerSamples = statsForContainers(uniqueContainers)
+        guard let containerSamples = statsForContainers(uniqueContainers) else {
+            // `docker ps` worked but `docker stats` didn't — don't trip
+            // the cooldown for this; the daemon's responsive enough for
+            // listing, just possibly slow on stats. Next poll will retry.
+            return [:]
+        }
         if containerSamples.isEmpty { return [:] }
+
         var result: [Int: Sample] = [:]
         for (port, containerID) in portMap {
             if let sample = containerSamples[containerID] {
@@ -53,6 +76,28 @@ enum DockerStats {
             }
         }
         return result
+    }
+
+    // MARK: Cooldown state
+
+    private static var consecutiveFailures: Int = 0
+    private static var cooldownUntil: Date = .distantPast
+    private static let maxConsecutiveFailures = 2
+    private static let cooldownDuration: TimeInterval = 60
+
+    private static func recordFailure() {
+        consecutiveFailures += 1
+        if consecutiveFailures >= maxConsecutiveFailures {
+            cooldownUntil = Date().addingTimeInterval(cooldownDuration)
+            log.info("Docker check failed \(consecutiveFailures) times in a row — skipping Docker for \(Int(cooldownDuration))s")
+            // Don't keep growing the counter forever; the cooldown is
+            // the actual rate-limit, the counter just gates entering it.
+            consecutiveFailures = 0
+        }
+    }
+
+    private static func recordSuccess() {
+        consecutiveFailures = 0
     }
 
     // MARK: Internals
@@ -78,16 +123,18 @@ enum DockerStats {
     }()
 
     /// Reads `docker ps` and parses each row's Ports column for host-port
-    /// mappings, returning `host_port → containerID`. A container with
-    /// no published ports doesn't appear in the result; a container with
-    /// multiple published ports appears once per port.
-    private static func portToContainerMap() -> [Int: String] {
-        guard let dockerPath else { return [:] }
+    /// mappings, returning `host_port → containerID`. Returns nil when the
+    /// `docker ps` call itself failed (timeout, daemon down, docker not
+    /// installed) so the caller can distinguish that case from a successful
+    /// call that just found no containers — and trip the cooldown only on
+    /// the former.
+    private static func portToContainerMap() -> [Int: String]? {
+        guard let dockerPath else { return nil }
         guard let result = SafeProcess.runCapturingOutput(
             launchPath: dockerPath,
             arguments: ["ps", "--format", "{{.ID}}\t{{.Ports}}"],
-            timeout: 2
-        ), result.exitCode == 0 else { return [:] }
+            timeout: 1
+        ), result.exitCode == 0 else { return nil }
 
         var map: [Int: String] = [:]
         for line in result.stdout.components(separatedBy: "\n") {
@@ -105,14 +152,16 @@ enum DockerStats {
 
     /// Reads `docker stats --no-stream` for the given containers in one
     /// call (Docker accepts multiple IDs as positional args) so we don't
-    /// pay process-spawn overhead per container.
-    private static func statsForContainers(_ containerIDs: [String]) -> [String: Sample] {
+    /// pay process-spawn overhead per container. Returns nil on call
+    /// failure (caller treats it as "skip stats this poll" rather than
+    /// "Docker is broken — cool it down").
+    private static func statsForContainers(_ containerIDs: [String]) -> [String: Sample]? {
         guard let dockerPath, !containerIDs.isEmpty else { return [:] }
         guard let result = SafeProcess.runCapturingOutput(
             launchPath: dockerPath,
             arguments: ["stats", "--no-stream", "--format", "{{.ID}}\t{{.CPUPerc}}\t{{.MemUsage}}"] + containerIDs,
-            timeout: 3
-        ), result.exitCode == 0 else { return [:] }
+            timeout: 2
+        ), result.exitCode == 0 else { return nil }
 
         var samples: [String: Sample] = [:]
         for line in result.stdout.components(separatedBy: "\n") {
