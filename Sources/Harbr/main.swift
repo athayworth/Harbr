@@ -4208,6 +4208,23 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor func startProjectDirectly(_ project: Project) {
+        // Pre-flight: if the project's directory no longer exists (drive
+        // unmounted, project renamed, config drifted), the AppleScript
+        // would fire `cd <dir>` in Terminal, fail silently, the script
+        // wrapper would exit immediately, and the supervised window
+        // would expire with no log written — a confusing "Starting…"
+        // flash followed by nothing. Surface it loudly here so the user
+        // can fix the config or remount the drive instead of debugging
+        // a ghost.
+        var isDirectory: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: project.directory, isDirectory: &isDirectory) || !isDirectory.boolValue {
+            showAlert(
+                title: "Couldn't start \(project.name)",
+                message: "The project's directory doesn't exist:\n\n\(project.directory)\n\nIt may have been renamed, moved, or the drive isn't mounted. Edit the project to fix the path."
+            )
+            return
+        }
+
         // Clear user-stopped flag since we're starting it
         userStoppedPorts.remove(project.port)
 

@@ -116,6 +116,12 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Starting a project whose directory has been renamed, moved, or
+  unmounted now shows a clear alert ("The project's directory
+  doesn't exist…") instead of opening a Terminal that runs `cd
+  /missing/path`, fails silently, and lets the supervised window
+  expire with no log written. Catches the case where Harbr config
+  references a folder that no longer exists.
 - Every Next.js / Vite / etc. project showing the yellow "foreign"
   exclamation icon even when Harbr spawned it. Node frameworks
   brand themselves via `process.title` (Next.js reports
