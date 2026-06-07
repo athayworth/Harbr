@@ -263,13 +263,16 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         healthLabel.frame = NSRect(x: 20, y: currentY, width: labelWidth, height: 20)
         healthLabel.alignment = .right
         healthLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        let healthHelp = "Optional. A URL Harbr visits to confirm the server is actually responding — not just that the port is open. Leave empty and Harbr only checks the port (good default). Common values: \"/\" for an SPA, \"/health\" or \"/api/ping\" for an API. If the URL returns 404 or an error, the project's dot turns yellow."
+        healthLabel.toolTip = healthHelp
         contentView.addSubview(healthLabel)
 
         healthCheckField = NSTextField(frame: NSRect(x: fieldX, y: currentY - 2, width: fieldWidth, height: 24))
         healthCheckField?.stringValue = project?.healthCheckUrl ?? ""
-        healthCheckField?.placeholderString = "/health or http://..."
+        healthCheckField?.placeholderString = "Leave empty to skip — or /health, /api/ping"
         healthCheckField?.font = NSFont.systemFont(ofSize: 13)
         healthCheckField?.bezelStyle = .roundedBezel
+        healthCheckField?.toolTip = healthHelp
         if let field = healthCheckField {
             contentView.addSubview(field)
         }
@@ -2209,14 +2212,31 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             """
         ),
         (
-            title: "Health checks",
+            title: "Health Check URL (the deeper green-dot test)",
             body: """
-            If you set a "Health Check URL" on a project, Harbr hits that URL \
-            every poll and only calls the project healthy if it gets a 2xx \
-            response. A green dot in the status column means the port is open \
-            AND the health URL is happy; a yellow dot means the port is open \
-            but the health URL is failing — usually the server has started but \
-            isn't actually serving requests yet (or it's crashed in-place).
+            Most dev servers can be "alive" in two ways. The simple one: \
+            something is listening on the port. The fussier one: that \
+            something is actually answering requests correctly — not stuck \
+            mid-startup, not hung on a database connection, not crashed in \
+            place with the port still held.
+
+            If you leave the project's "Health Check" field empty, Harbr \
+            only checks the simple thing. Green dot = port is open. Gray = \
+            nothing's listening. That's enough for most projects.
+
+            If you fill in a URL like `/`, `/health`, or `/api/ping`, Harbr \
+            also visits that URL every few seconds and only paints the dot \
+            green when the server returns a successful response. If the URL \
+            comes back "not found" (404), an error, or doesn't answer in \
+            time, the dot turns yellow with a "!" — port is up but the \
+            server isn't responding correctly at that URL.
+
+            Common gotcha: you cloned a project from another that had a \
+            health URL configured, and the new project doesn't actually \
+            have that endpoint. The dot stays stubbornly yellow. Fix: edit \
+            the project and either clear the Health Check field (Harbr \
+            falls back to the port-only check) or change it to a URL the \
+            server actually serves. When in doubt, clear it.
             """
         ),
         (
