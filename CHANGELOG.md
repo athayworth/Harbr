@@ -116,6 +116,19 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Every Next.js / Vite / etc. project showing the yellow "foreign"
+  exclamation icon even when Harbr spawned it. Node frameworks
+  brand themselves via `process.title` (Next.js reports
+  `next-server (v16.1.1)`, Vite reports `vite`), and `ps -o comm=`
+  echoes the branded title — which doesn't match the project's
+  `npm run dev` start command via the v1 lookup table. Two fixes:
+  the `ps` parser now joins all post-RSS tokens and strips the
+  `(version)` suffix so the matcher sees the canonical
+  `next-server` name, and the launcher table gained explicit
+  entries for the framework-branded process names (`next-server`,
+  `vite`, `nuxt`, `astro`, `remix-serve`, `streamlit`, `uvicorn`,
+  `rails`, `phoenix`) plus a contains-fallback so version-suffixed
+  binaries like `python3.11` route through the `python` rules.
 - Projects all showing as "stopped" even when actually running, on
   systems under memory pressure or with Docker Desktop hung. Three
   cascading causes: (1) `docker ps` blocking 2s every poll, (2) the
