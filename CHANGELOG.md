@@ -116,6 +116,17 @@ to the new version + release date and start a fresh `[Unreleased]` block.
 
 ### Fixed
 
+- Edit / Add Project window opened with a tall band of empty space
+  at the top and the Save/Cancel buttons overlapping the bottom
+  checkboxes. Two compounding causes: (1) the form's `currentY=238`
+  start position in a 408-tall content view pushed the
+  capture-output checkbox below y=0 (clipped) and let the buttons
+  overlap it, and (2) macOS state restoration was re-applying a
+  taller saved frame even on this non-resizable window. Content
+  rect resized to 500×360 to actually fit the form, currentY
+  recalculated to 320 so the first field sits ~20px below the title
+  bar, and `window.isRestorable = false` so each open uses the
+  fresh contentRect.
 - Starting a project whose directory has been renamed, moved, or
   unmounted now shows a clear alert ("The project's directory
   doesn't exist…") instead of opening a Terminal that runs `cd
