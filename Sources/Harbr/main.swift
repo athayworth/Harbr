@@ -442,6 +442,11 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             alert.informativeText = "Please fill in all fields with valid values."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
+            // Defense in depth: even though the editor window is usually
+            // key when validation fires, an alert presented without an
+            // activate can land hidden behind another app on macOS for
+            // LSUIElement processes.
+            NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
             return
         }
@@ -453,6 +458,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             alert.informativeText = "Port must be between 1 and 65535."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
             return
         }
@@ -466,6 +472,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
             alert.informativeText = "The directory \"\(directory)\" does not exist. Create it first or choose a different path."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
             return
         }
@@ -4253,6 +4260,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.addButton(withTitle: "Start Anyway")
             alert.addButton(withTitle: "Cancel")
 
+            // See showAlert: LSUIElement apps need an explicit activate or
+            // the dialog opens hidden behind whatever's frontmost.
+            NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() != .alertFirstButtonReturn {
                 return
             }
@@ -4695,6 +4705,11 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
+        // LSUIElement apps don't auto-activate when fired from a status-bar
+        // menu, so runModal would open the alert hidden behind whatever was
+        // frontmost — and the whole app would lock up waiting on a dialog
+        // the user can't see.
+        NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
 
@@ -4890,6 +4905,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
 
+        // See showAlert: LSUIElement apps need an explicit activate or
+        // the dialog opens hidden behind whatever's frontmost.
+        NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             // Match by port only — it's the unique key. Matching by name+port
             // silently fails when the user has renamed the project after the
