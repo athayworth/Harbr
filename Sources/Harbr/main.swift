@@ -1778,16 +1778,25 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             let foreign = status?.foreignProcessCommand
             let foreignWarning = active && foreign != nil
             let starting = !active && (app?.isStarting(port: project.port) ?? false)
-            let symbol: String = active ? "circle.fill"
+            let dirMissing = status?.directoryMissing ?? false
+            // Directory-missing takes precedence: it's a config error, not
+            // a transient runtime state, and Start would fail until fixed.
+            let symbol: String = dirMissing ? "exclamationmark.triangle.fill"
+                              : active ? "circle.fill"
                               : starting ? "circle.dotted"
                               : "circle"
             dot.image = NSImage(systemSymbolName: symbol,
-                                accessibilityDescription: starting ? "Starting" : (active ? "Running" : "Stopped"))
-            dot.contentTintColor = (unhealthy || foreignWarning) ? .systemYellow
+                                accessibilityDescription: dirMissing ? "Directory missing"
+                                : starting ? "Starting"
+                                : (active ? "Running" : "Stopped"))
+            dot.contentTintColor = dirMissing ? .systemRed
+                                  : (unhealthy || foreignWarning) ? .systemYellow
                                   : active ? .systemGreen
                                   : starting ? .controlAccentColor
                                   : .tertiaryLabelColor
-            if let foreign {
+            if dirMissing {
+                dot.toolTip = "Project directory not found:\n\(project.directory)\n\nIt may have been moved, renamed, or its drive isn't mounted. Edit the project to fix the path."
+            } else if let foreign {
                 dot.toolTip = "Port \(project.port) is held by \(foreign), not by what \"\(project.startCommand)\" would spawn. If you didn't start this, another app is using the port."
             } else if unhealthy {
                 dot.toolTip = "Port is open but the project's health check is failing."
@@ -3071,6 +3080,11 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         /// list of the foreign command names, suitable for a status-dot
         /// tooltip. Docker-backed ports are never considered foreign.
         let foreignProcessCommand: String?
+        /// True when the project's configured directory can't be reached
+        /// (deleted, renamed, drive unmounted). Surfaced in the status dot
+        /// so users discover config drift before clicking Start and getting
+        /// a "Couldn't start" alert. Stat'd cheaply each poll cycle.
+        let directoryMissing: Bool
     }
 
     /// Cache for port status to avoid blocking the menu on each open.
@@ -3487,12 +3501,23 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 }
 
+                // Cheap stat per project per poll. fileExists returns false
+                // immediately for unmounted volumes (kernel knows the mount
+                // table) so a missing /Volumes/... drive doesn't block the
+                // poll thread. Stays off main, so the menu-bar UI never
+                // pays for this.
+                var dirIsDir: ObjCBool = false
+                let dirOk = FileManager.default.fileExists(
+                    atPath: project.directory, isDirectory: &dirIsDir
+                ) && dirIsDir.boolValue
+
                 newCache[project.port] = PortStatus(
                     isActive: isActive,
                     cpuUsage: cpu,
                     memoryUsage: mem,
                     healthStatus: nil,
-                    foreignProcessCommand: foreign
+                    foreignProcessCommand: foreign,
+                    directoryMissing: !dirOk
                 )
 
                 // Check for state change using captured snapshot
@@ -3538,7 +3563,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     cpuUsage: status.cpuUsage,
                     memoryUsage: status.memoryUsage,
                     healthStatus: healthy,
-                    foreignProcessCommand: status.foreignProcessCommand
+                    foreignProcessCommand: status.foreignProcessCommand,
+                    directoryMissing: status.directoryMissing
                 )
             }
 
@@ -4045,7 +4071,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
-        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil, foreignProcessCommand: nil)
+        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil, foreignProcessCommand: nil, directoryMissing: false)
         let title = "\(project.name)  :\(project.port)"
         let starting = isStarting(port: project.port)
 
@@ -4113,15 +4139,43 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let combined = NSMutableAttributedString(attributedString: primary)
             combined.append(suffix)
             item.attributedTitle = combined
+        } else if status.directoryMissing {
+            // Same suffix pattern: visible at a glance, no hover needed.
+            // Red because Start would fail until the path is fixed.
+            let primary = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            let suffix = NSAttributedString(
+                string: "   ·   Path not found",
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.systemRed
+                ]
+            )
+            let combined = NSMutableAttributedString(attributedString: primary)
+            combined.append(suffix)
+            item.attributedTitle = combined
         }
 
         // Use SF Symbols for status
-        // Green = running & healthy, Yellow = running but unhealthy, Gray = stopped
+        // Green = running & healthy, Yellow = running but unhealthy, Red = directory missing, Gray = stopped
         let statusColor: NSColor
         let statusSymbol: String
         let statusDescription: String
 
-        if status.isActive {
+        if status.directoryMissing {
+            // Highest-priority error: the project's directory can't be
+            // reached, so Start would fail regardless of port state.
+            // Surface it ahead of all other statuses so users see drift
+            // (renamed/deleted dir, unmounted drive) before clicking Start.
+            statusColor = .systemRed
+            statusSymbol = "exclamationmark.triangle.fill"
+            statusDescription = "Directory missing"
+        } else if status.isActive {
             if status.healthStatus == false {
                 // Running but health check failed
                 statusColor = .systemYellow
@@ -4417,7 +4471,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             cpuUsage: nil,
             memoryUsage: nil,
             healthStatus: nil,
-            foreignProcessCommand: nil
+            foreignProcessCommand: nil,
+            directoryMissing: portStatusCache[port]?.directoryMissing ?? false
         )
         previousPortStates[port] = false
         rebuildMenu()
@@ -4485,7 +4540,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         cpuUsage: nil,
                         memoryUsage: nil,
                         healthStatus: nil,
-                        foreignProcessCommand: nil
+                        foreignProcessCommand: nil,
+                        directoryMissing: self.portStatusCache[port]?.directoryMissing ?? false
                     )
                     self.previousPortStates[port] = true
                     // Only surface a notification for user-initiated stops.
