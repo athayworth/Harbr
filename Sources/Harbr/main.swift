@@ -518,8 +518,15 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     }
 
     @MainActor func show() {
-        window?.makeKeyAndOrderFront(nil)
+        // Activate before ordering the window: LSUIElement apps fired from a
+        // status-bar menu aren't frontmost, so makeKeyAndOrderFront alone can
+        // open the window behind another app or on Harbr's "home" Space while
+        // the user is looking at a different Space (or fullscreen app). Setting
+        // moveToActiveSpace lets the window follow the user; activating first
+        // matches the established runModal fix from commit 74f94d0.
+        window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -947,8 +954,10 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) { dismiss() }
 
     @MainActor func show() {
-        window?.makeKeyAndOrderFront(nil)
+        // See ProjectEditorWindow.show() for the rationale on order + Space behavior.
+        window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -2588,8 +2597,10 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     }
 
     @MainActor func show() {
-        window?.makeKeyAndOrderFront(nil)
+        // See ProjectEditorWindow.show() for the rationale on order + Space behavior.
+        window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 }
 
