@@ -93,6 +93,17 @@ enum SafeProcess {
             task.standardOutput = pipe
             task.standardError = FileHandle.nullDevice
 
+            // Signal exit via terminationHandler instead of parking a GCD worker
+            // on task.waitUntilExit(). The previous pattern (dispatch a utility
+            // thread to call waitUntilExit, then group.wait on the caller) leaked
+            // a worker every time waitUntilExit failed to return — which happens
+            // when SIGTERM is ignored or CFRunLoop inside waitUntilExit misses
+            // SIGCHLD. After enough leaks the 64-thread soft limit is reached and
+            // the whole app stalls (AppKit needs GCD for sheet presentation, so
+            // clicking the … browse button just spins the beachball).
+            let exited = DispatchSemaphore(value: 0)
+            task.terminationHandler = { _ in exited.signal() }
+
             do {
                 try task.run()
             } catch {
@@ -100,17 +111,16 @@ enum SafeProcess {
                 return
             }
 
-            // Wait with a timeout so a hung subprocess can't block the caller.
-            let group = DispatchGroup()
-            group.enter()
-            DispatchQueue.global(qos: .utility).async {
-                task.waitUntilExit()
-                group.leave()
-            }
-            if group.wait(timeout: .now() + timeout) == .timedOut {
+            if exited.wait(timeout: .now() + timeout) == .timedOut {
                 log.error("\(launchPath, privacy: .public) timed out after \(timeout)s, terminating")
                 task.terminate()
-                _ = group.wait(timeout: .now() + 1.0)
+                if exited.wait(timeout: .now() + 1.0) == .timedOut {
+                    // SIGTERM ignored — escalate. lsof/docker children can sit
+                    // in uninterruptible kernel waits where SIGKILL still works.
+                    let pid = task.processIdentifier
+                    if pid > 0 { kill(pid, SIGKILL) }
+                    _ = exited.wait(timeout: .now() + 1.0)
+                }
                 return
             }
 
