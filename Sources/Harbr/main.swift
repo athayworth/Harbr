@@ -518,15 +518,24 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
     }
 
     @MainActor func show() {
-        // Activate before ordering the window: LSUIElement apps fired from a
-        // status-bar menu aren't frontmost, so makeKeyAndOrderFront alone can
-        // open the window behind another app or on Harbr's "home" Space while
-        // the user is looking at a different Space (or fullscreen app). Setting
-        // moveToActiveSpace lets the window follow the user; activating first
-        // matches the established runModal fix from commit 74f94d0.
+        // LSUIElement apps fired from a status-bar menu aren't reliably
+        // granted activation in macOS 14+'s cooperative model — NSApp.activate
+        // is a request, not a guarantee. The orderFrontRegardless call forces
+        // the window above other apps' windows even when activation is denied;
+        // moveToActiveSpace makes it follow the user across Spaces/fullscreen.
         window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
+    }
+
+    /// Closes the window without invoking onDismiss. Used when something else
+    /// (e.g. the app re-presenting the editor) wants to take ownership of the
+    /// dismiss callback — invoking onDismiss here would race-nil the
+    /// caller's freshly-assigned currentEditorWindow.
+    @MainActor func closeSilently() {
+        onDismiss = nil
+        dismiss()
     }
 }
 
@@ -954,10 +963,11 @@ class ProjectScannerWindow: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) { dismiss() }
 
     @MainActor func show() {
-        // See ProjectEditorWindow.show() for the rationale on order + Space behavior.
+        // See ProjectEditorWindow.show() for the rationale.
         window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
     }
 }
 
@@ -2597,10 +2607,11 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     }
 
     @MainActor func show() {
-        // See ProjectEditorWindow.show() for the rationale on order + Space behavior.
+        // See ProjectEditorWindow.show() for the rationale.
         window?.collectionBehavior.insert(.moveToActiveSpace)
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
     }
 }
 
@@ -4781,6 +4792,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor @objc func addNewProject() {
+        // Close any prior editor first. AppKit retains displayed NSWindows
+        // independently of our wrapper, so just reassigning currentEditorWindow
+        // leaves the old window stranded on screen — and stacks a new one on
+        // top with each click. closeSilently clears its onDismiss before
+        // tearing down so the deferred nil-out doesn't race-clear the new one.
+        currentEditorWindow?.closeSilently()
+
         currentEditorWindow = ProjectEditorWindow { [weak self] project in
             self?.config?.projects.append(project)
             self?.saveConfig()
@@ -4945,6 +4963,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let originalPort = project.port
+
+        // See addNewProject for the closeSilently rationale.
+        currentEditorWindow?.closeSilently()
 
         currentEditorWindow = ProjectEditorWindow(project: project) { [weak self] updatedProject in
             guard let self = self,
