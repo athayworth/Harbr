@@ -1798,23 +1798,30 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
             let foreignWarning = active && foreign != nil
             let starting = !active && (app?.isStarting(port: project.port) ?? false)
             let dirMissing = status?.directoryMissing ?? false
+            // Directory-missing wins over spawn-failed: if both are true,
+            // the path is the root cause and the failure is downstream of
+            // it. Don't show two red states for the same problem.
+            let spawnFailed = !dirMissing && (status?.spawnFailed ?? false)
             // Directory-missing takes precedence: it's a config error, not
             // a transient runtime state, and Start would fail until fixed.
-            let symbol: String = dirMissing ? "exclamationmark.triangle.fill"
+            let symbol: String = (dirMissing || spawnFailed) ? "exclamationmark.triangle.fill"
                               : active ? "circle.fill"
                               : starting ? "circle.dotted"
                               : "circle"
             dot.image = NSImage(systemSymbolName: symbol,
                                 accessibilityDescription: dirMissing ? "Directory missing"
+                                : spawnFailed ? "Start failed"
                                 : starting ? "Starting"
                                 : (active ? "Running" : "Stopped"))
-            dot.contentTintColor = dirMissing ? .systemRed
+            dot.contentTintColor = (dirMissing || spawnFailed) ? .systemRed
                                   : (unhealthy || foreignWarning) ? .systemYellow
                                   : active ? .systemGreen
                                   : starting ? .controlAccentColor
                                   : .tertiaryLabelColor
             if dirMissing {
                 dot.toolTip = "Project directory not found:\n\(project.directory)\n\nIt may have been moved, renamed, or its drive isn't mounted. Edit the project to fix the path."
+            } else if spawnFailed {
+                dot.toolTip = "Started \(project.name) but port \(project.port) never came up. The start command exited without binding — check the log to see what went wrong."
             } else if let foreign {
                 dot.toolTip = "Port \(project.port) is held by \(foreign), not by what \"\(project.startCommand)\" would spawn. If you didn't start this, another app is using the port."
             } else if unhealthy {
@@ -2732,6 +2739,18 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// port-down is presumed intentional (e.g. `docker compose down` from
     /// another terminal) rather than a crash to recover from.
     var lastSpawnAt: [Int: Date] = [:]
+    /// Wall-clock of the most recent observation of the port as active.
+    /// Paired with `lastSpawnAt` to tell "spawn never bound at all"
+    /// (`lastSeenActive < lastSpawnAt` or nil — a Start failure worth
+    /// surfacing) apart from "spawn ran for a while and then stopped"
+    /// (`lastSeenActive >= lastSpawnAt` — just a normal shutdown).
+    var lastSeenActive: [Int: Date] = [:]
+    /// Per-port latch: stores the `lastSpawnAt` value we've already raised
+    /// a "didn't start" notification about. Prevents re-firing it every
+    /// 5s poll after the window expires. A fresh spawn updates
+    /// `lastSpawnAt`, the latch no longer matches, and a future failure
+    /// is free to notify again.
+    var spawnFailureNotified: [Int: Date] = [:]
     /// Duration after spawn during which auto-restart fires on port-down.
     /// Long enough to cover slow boots (Docker daemon warmup, supabase
     /// init), short enough that a server running for an hour and then
@@ -3107,6 +3126,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         /// so users discover config drift before clicking Start and getting
         /// a "Couldn't start" alert. Stat'd cheaply each poll cycle.
         let directoryMissing: Bool
+        /// True when Harbr fired a spawn but the supervised window expired
+        /// without the port ever binding. Catches fast-exit failures (script
+        /// crash, missing dep, wrong working dir) that the directoryMissing
+        /// pre-flight can't see — the directory exists, but whatever the
+        /// startCommand referenced inside it doesn't run cleanly.
+        let spawnFailed: Bool
     }
 
     /// Cache for port status to avoid blocking the menu on each open.
@@ -3480,6 +3505,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Capture states on main thread to avoid data race
         let capturedPreviousStates = self.previousPortStates
         let capturedUserStoppedPorts = self.userStoppedPorts
+        let capturedLastSpawnAt = self.lastSpawnAt
+        let capturedLastSeenActive = self.lastSeenActive
+        let capturedRestartAttempts = self.restartAttempts
         let projectsCopy = config.projects
 
         // Bump generation so any older in-flight poll is discarded at commit.
@@ -3533,13 +3561,35 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     atPath: project.directory, isDirectory: &dirIsDir
                 ) && dirIsDir.boolValue
 
+                // Spawn-failure detection: the directory pre-flight only
+                // catches missing dirs, not commands that crash inside a
+                // valid dir (bad script path, missing dep, syntax error).
+                // The signal we can observe cheaply is "we kicked off a
+                // start, the supervised window has elapsed, and the port
+                // still hasn't bound." Distinguish that from "spawn ran
+                // for a while and then stopped" by requiring no active
+                // observation since the spawn — otherwise an old project
+                // that's been intentionally shut down would flag as a
+                // failure forever.
+                let spawnFailed: Bool = {
+                    guard let spawn = capturedLastSpawnAt[project.port],
+                          !isActive,
+                          Date().timeIntervalSince(spawn) > HarbrApp.SUPERVISED_WINDOW
+                    else { return false }
+                    if let seen = capturedLastSeenActive[project.port], seen >= spawn {
+                        return false
+                    }
+                    return true
+                }()
+
                 newCache[project.port] = PortStatus(
                     isActive: isActive,
                     cpuUsage: cpu,
                     memoryUsage: mem,
                     healthStatus: nil,
                     foreignProcessCommand: foreign,
-                    directoryMissing: !dirOk
+                    directoryMissing: !dirOk,
+                    spawnFailed: spawnFailed
                 )
 
                 // Check for state change using captured snapshot
@@ -3586,7 +3636,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     memoryUsage: status.memoryUsage,
                     healthStatus: healthy,
                     foreignProcessCommand: status.foreignProcessCommand,
-                    directoryMissing: status.directoryMissing
+                    directoryMissing: status.directoryMissing,
+                    spawnFailed: status.spawnFailed
                 )
             }
 
@@ -3670,6 +3721,39 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 )
                                 projectsToRestart.append(change.project)
                             }
+                        }
+                    }
+                }
+
+                // Refresh "last seen active" for any port currently bound,
+                // and one-shot the "didn't start" notification for ports
+                // that just crossed into spawn-failed. This has to happen
+                // before the cache commit so a later observer (e.g. the
+                // window reload below) sees consistent state. Gated on
+                // !isStale because a stale poll's view of who's bound /
+                // who's failed may already be wrong.
+                if !isStale {
+                    for project in projectsCopy {
+                        guard let status = newCache[project.port] else { continue }
+                        if status.isActive {
+                            self.lastSeenActive[project.port] = Date()
+                        }
+                        // Spawn-failed notification: fire once per spawn.
+                        // Skip when the auto-restart loop is involved —
+                        // it raises its own "auto-restart suspended"
+                        // notification and we don't want both. Skip when
+                        // the user explicitly stopped, since they already
+                        // know.
+                        if status.spawnFailed,
+                           let spawn = capturedLastSpawnAt[project.port],
+                           self.spawnFailureNotified[project.port] != spawn,
+                           capturedRestartAttempts[project.port, default: 0] == 0,
+                           !capturedUserStoppedPorts.contains(project.port) {
+                            self.spawnFailureNotified[project.port] = spawn
+                            self.sendNotification(
+                                title: "\(project.name) didn't start",
+                                body: "Port \(project.port) never came up after starting. The start command likely failed — check the log."
+                            )
                         }
                     }
                 }
@@ -4093,7 +4177,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor private func addProjectMenuItem(_ project: Project, to menu: NSMenu) {
-        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil, foreignProcessCommand: nil, directoryMissing: false)
+        let status = portStatusCache[project.port] ?? PortStatus(isActive: false, cpuUsage: nil, memoryUsage: nil, healthStatus: nil, foreignProcessCommand: nil, directoryMissing: false, spawnFailed: false)
         let title = "\(project.name)  :\(project.port)"
         let starting = isStarting(port: project.port)
 
@@ -4181,6 +4265,29 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let combined = NSMutableAttributedString(attributedString: primary)
             combined.append(suffix)
             item.attributedTitle = combined
+        } else if status.spawnFailed {
+            // Spawn ran but the port never bound within the supervised
+            // window. Without this surface, the project would silently
+            // roll from "Starting…" to plain "Stopped" with no
+            // explanation — the exact "I clicked Start and nothing
+            // happened" gap the supervised window was meant to close.
+            let primary = NSAttributedString(
+                string: title,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.labelColor
+                ]
+            )
+            let suffix = NSAttributedString(
+                string: "   ·   Start failed",
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor.systemRed
+                ]
+            )
+            let combined = NSMutableAttributedString(attributedString: primary)
+            combined.append(suffix)
+            item.attributedTitle = combined
         }
 
         // Use SF Symbols for status
@@ -4197,6 +4304,15 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusColor = .systemRed
             statusSymbol = "exclamationmark.triangle.fill"
             statusDescription = "Directory missing"
+        } else if status.spawnFailed {
+            // Spawn fired but the port never bound in the supervised
+            // window. Sits below directoryMissing in priority — if both
+            // are true the path is the root cause — but above active /
+            // starting / stopped so the user sees the failure rather
+            // than a silent "Stopped."
+            statusColor = .systemRed
+            statusSymbol = "exclamationmark.triangle.fill"
+            statusDescription = "Start failed"
         } else if status.isActive {
             if status.healthStatus == false {
                 // Running but health check failed
@@ -4494,7 +4610,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             memoryUsage: nil,
             healthStatus: nil,
             foreignProcessCommand: nil,
-            directoryMissing: portStatusCache[port]?.directoryMissing ?? false
+            directoryMissing: portStatusCache[port]?.directoryMissing ?? false,
+            // Stop = the user acknowledged the project is not running.
+            // Drop any lingering spawn-failure flag so the row reads as a
+            // clean Stopped rather than continuing to scream red until
+            // the next Start.
+            spawnFailed: false
         )
         previousPortStates[port] = false
         rebuildMenu()
@@ -4563,7 +4684,8 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         memoryUsage: nil,
                         healthStatus: nil,
                         foreignProcessCommand: nil,
-                        directoryMissing: self.portStatusCache[port]?.directoryMissing ?? false
+                        directoryMissing: self.portStatusCache[port]?.directoryMissing ?? false,
+                        spawnFailed: self.portStatusCache[port]?.spawnFailed ?? false
                     )
                     self.previousPortStates[port] = true
                     // Only surface a notification for user-initiated stops.
