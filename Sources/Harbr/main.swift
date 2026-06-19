@@ -2764,12 +2764,35 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pendingMenuRebuild = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Singleton guard. `LSMultipleInstancesProhibited` only catches launches
+        // that go through Launch Services; a LaunchAgent that direct-execs our
+        // Mach-O (or any other launchd job that bypasses LS) slips past it and
+        // we end up with two menu-bar icons. If another instance with the same
+        // bundle ID is already registered with the workspace, the lower-PID
+        // copy wins and the duplicate exits before touching the status bar.
+        if let bundleID = Bundle.main.bundleIdentifier {
+            let mePID = NSRunningApplication.current.processIdentifier
+            let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                .filter { $0.processIdentifier != mePID }
+            if others.contains(where: { $0.processIdentifier < mePID }) {
+                Self.launchAgentLog.info("Another Harbr instance is already running; exiting duplicate (pid=\(mePID, privacy: .public)).")
+                exit(0)
+            }
+        }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         applyMemoryPressureToStatusIcon()
         startMemoryPressureMonitoring()
 
         loadConfig()
+        // Self-heal any stale LaunchAgent plist left over from older builds
+        // that wrote a direct-exec `ProgramArguments` pointing at the inner
+        // Mach-O. Rewriting with the current (LS-mediated) format is cheap
+        // and idempotent.
+        if config?.launchAtLogin == true {
+            installLaunchAgent()
+        }
         Self.ensureLogsDir()
         updateManager = UpdateManager()
         buildAppMainMenu()
@@ -4821,9 +4844,18 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func installLaunchAgent() {
-        let appPath = Bundle.main.bundlePath.isEmpty
-            ? ProcessInfo.processInfo.arguments[0]
-            : "\(Bundle.main.bundlePath)/Contents/MacOS/Harbr"
+        // Route through `open -a <bundle>` rather than execing the inner
+        // Mach-O. Direct exec by launchd bypasses Launch Services entirely,
+        // which means `LSMultipleInstancesProhibited` in Info.plist cannot
+        // suppress a duplicate when another autostart mechanism (a stale
+        // SMAppService login item, Finder Login Items entry, etc.) also
+        // fires at login. `open -a` goes through LS, so the plist key
+        // actually does its job.
+        let bundlePath = Bundle.main.bundlePath
+        guard !bundlePath.isEmpty else {
+            Self.launchAgentLog.error("Bundle.main.bundlePath is empty; refusing to install LaunchAgent.")
+            return
+        }
 
         let plistContent = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -4834,7 +4866,9 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             <string>com.harbr.app</string>
             <key>ProgramArguments</key>
             <array>
-                <string>\(appPath)</string>
+                <string>/usr/bin/open</string>
+                <string>-a</string>
+                <string>\(bundlePath)</string>
             </array>
             <key>RunAtLoad</key>
             <true/>
