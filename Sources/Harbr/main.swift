@@ -34,6 +34,20 @@ enum TerminalApp: String, Codable, CaseIterable {
     }
 }
 
+/// How to lay out terminals when multiple projects are launched at once
+/// (e.g. Start All). Single launches always get a fresh window regardless.
+enum MultiLaunchLayout: String, Codable, CaseIterable {
+    case separateWindows
+    case tabs
+
+    var displayName: String {
+        switch self {
+        case .separateWindows: return "Separate windows"
+        case .tabs: return "Tabs in one window"
+        }
+    }
+}
+
 /// Represents a development project with its server configuration.
 struct Project: Codable {
     let name: String
@@ -77,11 +91,19 @@ struct Config: Codable {
     var terminalApp: TerminalApp?
     var notificationsEnabled: Bool?
     var launchAtLoginEnabled: Bool?
+    var multiLaunchLayoutMode: MultiLaunchLayout?
 
     /// The terminal to use, defaulting to Terminal.app if not set.
     var terminal: TerminalApp {
         get { terminalApp ?? .terminal }
         set { terminalApp = newValue }
+    }
+
+    /// Layout to use when spawning multiple terminals at once. Defaults to
+    /// separate windows to match Harbr's pre-preference behavior.
+    var multiLaunchLayout: MultiLaunchLayout {
+        get { multiLaunchLayoutMode ?? .separateWindows }
+        set { multiLaunchLayoutMode = newValue }
     }
 
     /// Whether to show notifications when servers start/stop.
@@ -1488,6 +1510,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
     // Settings tab
     private var terminalPopup: NSPopUpButton?
+    private var multiLaunchLayoutPopup: NSPopUpButton?
     private var notificationsCheckbox: NSButton?
     private var launchAtLoginCheckbox: NSButton?
     private var captureLogsDefaultLabel: NSTextField?
@@ -2439,6 +2462,38 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
 
         y -= 44
 
+        // Multi-launch layout: how Start All spreads spawns across windows/tabs.
+        let layoutLabel = NSTextField(labelWithString: "Start All layout:")
+        layoutLabel.frame = NSRect(x: 20, y: y, width: 160, height: 20)
+        layoutLabel.autoresizingMask = [.minYMargin]
+        container.addSubview(layoutLabel)
+
+        let layoutPopup = NSPopUpButton(frame: NSRect(x: 190, y: y - 4, width: 220, height: 26))
+        for layout in MultiLaunchLayout.allCases {
+            layoutPopup.addItem(withTitle: layout.displayName)
+            layoutPopup.lastItem?.representedObject = layout
+        }
+        let currentLayout = app?.config?.multiLaunchLayout ?? .separateWindows
+        if let idx = MultiLaunchLayout.allCases.firstIndex(of: currentLayout) {
+            layoutPopup.selectItem(at: idx)
+        }
+        layoutPopup.target = self
+        layoutPopup.action = #selector(multiLaunchLayoutPopupChanged(_:))
+        layoutPopup.autoresizingMask = [.minYMargin]
+        container.addSubview(layoutPopup)
+        self.multiLaunchLayoutPopup = layoutPopup
+
+        y -= 18
+
+        let layoutHint = NSTextField(labelWithString: "Single Start clicks always open a new window. Warp always uses new windows.")
+        layoutHint.font = NSFont.systemFont(ofSize: 10)
+        layoutHint.textColor = .tertiaryLabelColor
+        layoutHint.frame = NSRect(x: 40, y: y, width: bounds.width - 60, height: 16)
+        layoutHint.autoresizingMask = [.minYMargin, .width]
+        container.addSubview(layoutHint)
+
+        y -= 32
+
         // Notifications
         let notif = NSButton(checkboxWithTitle: "Show notifications when servers start, stop, or auto-restart",
                              target: self, action: #selector(notificationsToggled))
@@ -2501,6 +2556,12 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     @MainActor @objc private func terminalPopupChanged(_ sender: NSPopUpButton) {
         guard let selected = sender.selectedItem?.representedObject as? TerminalApp else { return }
         app?.config?.terminal = selected
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func multiLaunchLayoutPopupChanged(_ sender: NSPopUpButton) {
+        guard let selected = sender.selectedItem?.representedObject as? MultiLaunchLayout else { return }
+        app?.config?.multiLaunchLayout = selected
         app?.saveConfig()
     }
 
@@ -3006,7 +3067,15 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Opens a terminal window in the specified directory, optionally running a command.
-    @MainActor func openTerminal(directory: String, command: String? = nil, activate: Bool = true) {
+    ///
+    /// - Parameter useTab: When true and the target terminal supports it,
+    ///   opens the spawn as a new tab in the frontmost terminal window
+    ///   rather than creating a new window. Used by the Start All flow when
+    ///   the "tabs in one window" layout is selected. The FIRST spawn of a
+    ///   batch always passes false so that we create a fresh window rather
+    ///   than hijacking a pre-existing terminal window the user was working
+    ///   in; subsequent spawns pass true to nest tabs into that window.
+    @MainActor func openTerminal(directory: String, command: String? = nil, activate: Bool = true, useTab: Bool = false) {
         let terminal = config?.terminal ?? .terminal
         // Directory goes inside `cd '...'` in the template, so it needs sh
         // escaping for any `'` it might contain. Then AppleScript-escape the
@@ -3020,29 +3089,62 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let script: String
         switch terminal {
         case .terminal:
+            // Terminal.app's AppleScript doesn't expose a "create tab" verb —
+            // `do script` always spawns a new window unless targeted at an
+            // existing tab. To get a new tab in the frontmost window we
+            // synthesize Cmd-T via System Events, then reuse the freshly
+            // created tab with `do script "…" in selected tab of front window`.
+            let bodyLine: String
             if let cmd = safeCommand {
+                bodyLine = "cd '\(safeDirectory)' && \(cmd)"
+            } else {
+                bodyLine = "cd '\(safeDirectory)'"
+            }
+            if useTab {
                 script = """
                 tell application "Terminal"
-                    do script "cd '\(safeDirectory)' && \(cmd)"
+                    activate
+                end tell
+                delay 0.15
+                tell application "System Events"
+                    tell process "Terminal" to keystroke "t" using command down
+                end tell
+                delay 0.15
+                tell application "Terminal"
+                    do script "\(bodyLine)" in selected tab of front window
                     \(activate ? "activate" : "")
                 end tell
                 """
             } else {
                 script = """
                 tell application "Terminal"
-                    do script "cd '\(safeDirectory)'"
+                    do script "\(bodyLine)"
                     \(activate ? "activate" : "")
                 end tell
                 """
             }
 
         case .iterm:
+            // iTerm has a real "create tab" verb. `create tab of current
+            // window` targets whichever window is currently frontmost inside
+            // iTerm — which, given our serial AppleScript queue, is the
+            // window we just created a moment ago in the same batch.
+            let bodyLine: String
             if let cmd = safeCommand {
+                bodyLine = "cd '\(safeDirectory)' && \(cmd)"
+            } else {
+                bodyLine = "cd '\(safeDirectory)'"
+            }
+            if useTab {
                 script = """
                 tell application "iTerm"
-                    create window with default profile
+                    if (count of windows) = 0 then
+                        create window with default profile
+                    else
+                        tell current window to create tab with default profile
+                    end if
                     tell current session of current window
-                        write text "cd '\(safeDirectory)' && \(cmd)"
+                        write text "\(bodyLine)"
                     end tell
                     \(activate ? "activate" : "")
                 end tell
@@ -3052,7 +3154,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 tell application "iTerm"
                     create window with default profile
                     tell current session of current window
-                        write text "cd '\(safeDirectory)'"
+                        write text "\(bodyLine)"
                     end tell
                     \(activate ? "activate" : "")
                 end tell
@@ -3060,28 +3162,40 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
         case .warp:
-            // Warp uses a different approach - open via URL scheme or direct launch
+            // Warp doesn't have first-class AppleScript. We used to `activate`
+            // Warp and then keystroke into whatever ended up frontmost — which
+            // hijacked the user's focused window if Warp lagged coming forward.
+            // Now: shell out to `open -na Warp <dir>` so Warp opens a fresh
+            // window already cd'd to the target directory (Warp registers as
+            // a directory handler for `open`), and only then keystroke the
+            // command. The keystroke still races Warp on unlucky machines, so
+            // we guard it with `frontmost of process "Warp"` — if Warp isn't
+            // actually front by the time we're about to type, we abort rather
+            // than spraying the command into whichever app IS front.
+            //
+            // The `-n` flag forces a new instance; combined with LSMultipleInstancesProhibited
+            // Warp treats it as a new window rather than a new process. `useTab`
+            // is intentionally ignored for Warp — its scriptability is too
+            // limited to reliably drive tab creation. (Falls through to
+            // "new window" for both layouts.)
+            let escapedDirForShell = directory.replacingOccurrences(of: "'", with: "'\\''")
+            let openCommand = "/usr/bin/open -na 'Warp' '\(escapedDirForShell)'"
+            let openCommandEscaped = appleScriptEscape(openCommand)
             if let cmd = safeCommand {
+                let keystrokeLine = "cd '\(safeDirectory)' && \(cmd)"
                 script = """
-                tell application "Warp"
-                    \(activate ? "activate" : "")
-                end tell
-                delay 0.5
+                do shell script "\(openCommandEscaped)"
+                delay 0.4
                 tell application "System Events"
-                    keystroke "cd '\(safeDirectory)' && \(cmd)"
-                    key code 36
+                    if frontmost of application process "Warp" then
+                        keystroke "\(keystrokeLine)"
+                        key code 36
+                    end if
                 end tell
                 """
             } else {
                 script = """
-                tell application "Warp"
-                    \(activate ? "activate" : "")
-                end tell
-                delay 0.5
-                tell application "System Events"
-                    keystroke "cd '\(safeDirectory)'"
-                    key code 36
-                end tell
+                do shell script "\(openCommandEscaped)"
                 """
             }
         }
@@ -4027,6 +4141,20 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         terminalItem.submenu = terminalSubmenu
         prefsSubmenu.addItem(terminalItem)
 
+        // Multi-launch layout submenu.
+        let layoutItem = NSMenuItem(title: "Start All Layout", action: nil, keyEquivalent: "")
+        let layoutSubmenu = NSMenu()
+        let currentLayout = config.multiLaunchLayout
+        for layout in MultiLaunchLayout.allCases {
+            let item = NSMenuItem(title: layout.displayName, action: #selector(setMultiLaunchLayout(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = layout
+            item.state = (layout == currentLayout) ? .on : .off
+            layoutSubmenu.addItem(item)
+        }
+        layoutItem.submenu = layoutSubmenu
+        prefsSubmenu.addItem(layoutItem)
+
         prefsSubmenu.addItem(NSMenuItem.separator())
 
         let notificationsItem = NSMenuItem(title: "Notifications", action: #selector(toggleNotifications), keyEquivalent: "")
@@ -4533,11 +4661,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Build the env-prefixed command and hand off to openTerminal. Split out
-    /// of startProjectDirectly so the port-conflict path can defer the spawn
-    /// without duplicating the command-building logic. Recording lastSpawnAt
-    /// here is the single chokepoint that opens the supervised window.
-    @MainActor private func openProjectTerminal(_ project: Project, activate: Bool = true) {
+    /// Build the fully-wrapped start command for a project — env prefix +
+    /// `script -q` log capture wrapping. Extracted so `openProjectTerminal`
+    /// and the Start All batch path can share the exact same command
+    /// construction (any divergence here silently breaks log capture or env
+    /// injection for one path).
+    @MainActor private func buildStartCommand(for project: Project) -> String {
         var command = project.startCommand
         if let envVars = project.envVars, !envVars.isEmpty {
             let envPrefix = envVars.map { "\($0.key)='\($0.value)'" }.joined(separator: " ")
@@ -4565,9 +4694,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let escapedLog = logPath.replacingOccurrences(of: "'", with: "'\\''")
             command = "/usr/bin/script -q '\(escapedLog)' /bin/sh -c '\(escapedInner)'"
         }
+        return command
+    }
 
+    /// Build the env-prefixed command and hand off to openTerminal. Split out
+    /// of startProjectDirectly so the port-conflict path can defer the spawn
+    /// without duplicating the command-building logic. Recording lastSpawnAt
+    /// here is the single chokepoint that opens the supervised window.
+    @MainActor private func openProjectTerminal(_ project: Project, activate: Bool = true, useTab: Bool = false) {
+        let command = buildStartCommand(for: project)
         lastSpawnAt[project.port] = Date()
-        openTerminal(directory: project.directory, command: command, activate: activate)
+        openTerminal(directory: project.directory, command: command, activate: activate, useTab: useTab)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.updateMenu()
@@ -4759,14 +4896,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor @objc func startAllProjects() {
         guard let config = config else { return }
 
-        for project in config.projects {
-            let status = portStatusCache[project.port]
-            if status?.isActive != true {
-                // Route through openProjectTerminal so each project gets its
-                // supervised window opened (and env-var handling stays in one
-                // place). activate:false because we activate once below.
-                openProjectTerminal(project, activate: false)
-            }
+        // In tabs layout, the FIRST spawn must open a new window (so we
+        // don't hijack whatever terminal window the user happens to have
+        // focused) and every subsequent spawn opens as a tab inside that
+        // window. Track which projects need to be spawned first and label
+        // the first one specially. Separate-windows layout ignores the flag.
+        let tabsLayout = config.multiLaunchLayout == .tabs
+        let toSpawn = config.projects.filter { portStatusCache[$0.port]?.isActive != true }
+        for (index, project) in toSpawn.enumerated() {
+            let useTab = tabsLayout && index > 0
+            // activate:false because we activate once below.
+            openProjectTerminal(project, activate: false, useTab: useTab)
         }
 
         // Activate terminal once after all scripts are queued
@@ -4818,6 +4958,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor @objc func setTerminalApp(_ sender: NSMenuItem) {
         guard let terminal = sender.representedObject as? TerminalApp else { return }
         config?.terminal = terminal
+        saveConfig()
+    }
+
+    @MainActor @objc func setMultiLaunchLayout(_ sender: NSMenuItem) {
+        guard let layout = sender.representedObject as? MultiLaunchLayout else { return }
+        config?.multiLaunchLayout = layout
         saveConfig()
     }
 
