@@ -37,6 +37,23 @@ else
     echo "Warning: AppIcon.icns not found, app will use default icon"
 fi
 
+# Bundle Sparkle.framework and wire the rpath so the app can load it at
+# runtime. Without both steps the app crashes on first frame with:
+#   Library not loaded: @rpath/Sparkle.framework/…
+# swift build's default rpaths only cover /usr/lib/swift and @loader_path
+# (which is Contents/MacOS/, not Contents/Frameworks/) — neither contains
+# Sparkle. -R preserves the framework's symlinks; --deep on the codesign
+# step below re-signs the nested framework.
+SPARKLE_SRC="$PROJECT_DIR/.build/release/Sparkle.framework"
+if [ -d "$SPARKLE_SRC" ]; then
+    FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
+    mkdir -p "$FRAMEWORKS_DIR"
+    cp -R "$SPARKLE_SRC" "$FRAMEWORKS_DIR/"
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+else
+    echo "Warning: Sparkle.framework not found at $SPARKLE_SRC — auto-updates will crash on launch"
+fi
+
 # Ad-hoc codesign so recent macOS will let the app request Automation /
 # Notifications permissions. Set CODESIGN_IDENTITY to your Developer ID
 # string if you have one (e.g. "Developer ID Application: Your Name (TEAMID)").
