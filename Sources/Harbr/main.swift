@@ -4012,6 +4012,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             let addItem = NSMenuItem(title: "Add a project manually…", action: #selector(addNewProject), keyEquivalent: "n")
             addItem.target = self
+            addItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
             menu.addItem(addItem)
 
             menu.addItem(NSMenuItem.separator())
@@ -4020,11 +4021,12 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // app and never find Activity / Settings.
             let openWindowItem = NSMenuItem(title: "Open Harbr Window", action: #selector(openMainWindow), keyEquivalent: "0")
             openWindowItem.target = self
-            openWindowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: "Open Window")
+            openWindowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
             menu.addItem(openWindowItem)
             menu.addItem(NSMenuItem.separator())
             let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
             quitItem.target = self
+            quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
             menu.addItem(quitItem)
             return
         }
@@ -4090,12 +4092,14 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if stoppedCount > 0 {
                 let startAllItem = NSMenuItem(title: "Start All", action: #selector(startAllProjects), keyEquivalent: "")
                 startAllItem.target = self
+                startAllItem.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
                 menu.addItem(startAllItem)
             }
 
             if runningCount > 0 {
                 let stopAllItem = NSMenuItem(title: "Stop All", action: #selector(stopAllProjects), keyEquivalent: "")
                 stopAllItem.target = self
+                stopAllItem.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: nil)
                 menu.addItem(stopAllItem)
             }
 
@@ -4104,25 +4108,31 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let openWindowItem = NSMenuItem(title: "Open Harbr…", action: #selector(openMainWindow), keyEquivalent: "0")
         openWindowItem.target = self
+        openWindowItem.image = NSImage(systemSymbolName: "macwindow", accessibilityDescription: nil)
         menu.addItem(openWindowItem)
 
         let scanProjectsItem = NSMenuItem(title: "Scan for Projects…", action: #selector(scanForProjects), keyEquivalent: "")
         scanProjectsItem.target = self
+        scanProjectsItem.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
         menu.addItem(scanProjectsItem)
 
         let addProjectItem = NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n")
         addProjectItem.target = self
+        addProjectItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
         menu.addItem(addProjectItem)
 
         let reloadItem = NSMenuItem(title: "Reload Config", action: #selector(reloadConfig), keyEquivalent: "r")
         reloadItem.target = self
+        reloadItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
         menu.addItem(reloadItem)
 
         // Preferences submenu
         let prefsItem = NSMenuItem(title: "Preferences", action: nil, keyEquivalent: ",")
+        prefsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         let prefsSubmenu = NSMenu()
 
         let terminalItem = NSMenuItem(title: "Terminal App", action: nil, keyEquivalent: "")
+        terminalItem.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
         let terminalSubmenu = NSMenu()
 
         let currentTerminal = config.terminal
@@ -4143,6 +4153,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Multi-launch layout submenu.
         let layoutItem = NSMenuItem(title: "Start All Layout", action: nil, keyEquivalent: "")
+        layoutItem.image = NSImage(systemSymbolName: "rectangle.split.2x1", accessibilityDescription: nil)
         let layoutSubmenu = NSMenu()
         let currentLayout = config.multiLaunchLayout
         for layout in MultiLaunchLayout.allCases {
@@ -4160,11 +4171,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let notificationsItem = NSMenuItem(title: "Notifications", action: #selector(toggleNotifications), keyEquivalent: "")
         notificationsItem.target = self
         notificationsItem.state = config.notifications ? .on : .off
+        notificationsItem.image = NSImage(systemSymbolName: "bell", accessibilityDescription: nil)
         prefsSubmenu.addItem(notificationsItem)
 
         let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchAtLoginItem.target = self
         launchAtLoginItem.state = config.launchAtLogin ? .on : .off
+        launchAtLoginItem.image = NSImage(systemSymbolName: "arrow.up.forward.app", accessibilityDescription: nil)
         prefsSubmenu.addItem(launchAtLoginItem)
 
         prefsItem.submenu = prefsSubmenu
@@ -4174,6 +4187,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
+        quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quitItem)
         // Menu is already assigned to statusItem, no need to reassign
     }
@@ -4540,37 +4554,44 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let stopItem = NSMenuItem(title: "Stop", action: #selector(stopProject(_:)), keyEquivalent: "")
             stopItem.representedObject = project
             stopItem.target = self
+            stopItem.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: nil)
             submenu.addItem(stopItem)
 
             let restartItem = NSMenuItem(title: "Restart", action: #selector(restartProject(_:)), keyEquivalent: "")
             restartItem.representedObject = project
             restartItem.target = self
+            restartItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
             submenu.addItem(restartItem)
         } else {
             let startItem = NSMenuItem(title: "Start", action: #selector(startProject(_:)), keyEquivalent: "")
             startItem.representedObject = project
             startItem.target = self
+            startItem.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
             submenu.addItem(startItem)
         }
 
         let openDirItem = NSMenuItem(title: "Open in Finder", action: #selector(openDirectory(_:)), keyEquivalent: "")
         openDirItem.representedObject = project
         openDirItem.target = self
+        openDirItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         submenu.addItem(openDirItem)
 
         let openTerminalItem = NSMenuItem(title: "Open in Terminal", action: #selector(openInTerminal(_:)), keyEquivalent: "")
         openTerminalItem.representedObject = project
         openTerminalItem.target = self
+        openTerminalItem.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
         submenu.addItem(openTerminalItem)
 
         let openBrowserItem = NSMenuItem(title: "Open in Browser", action: #selector(openInBrowser(_:)), keyEquivalent: "")
         openBrowserItem.representedObject = project
         openBrowserItem.target = self
+        openBrowserItem.image = NSImage(systemSymbolName: "safari", accessibilityDescription: nil)
         submenu.addItem(openBrowserItem)
 
         let copyUrlItem = NSMenuItem(title: "Copy URL", action: #selector(copyProjectUrl(_:)), keyEquivalent: "")
         copyUrlItem.representedObject = project
         copyUrlItem.target = self
+        copyUrlItem.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil)
         submenu.addItem(copyUrlItem)
 
         submenu.addItem(NSMenuItem.separator())
@@ -4578,11 +4599,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let editItem = NSMenuItem(title: "Edit...", action: #selector(editProject(_:)), keyEquivalent: "")
         editItem.representedObject = project
         editItem.target = self
+        editItem.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil)
         submenu.addItem(editItem)
 
         let deleteItem = NSMenuItem(title: "Delete...", action: #selector(deleteProject(_:)), keyEquivalent: "")
         deleteItem.representedObject = project
         deleteItem.target = self
+        deleteItem.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
         submenu.addItem(deleteItem)
 
         item.submenu = submenu
