@@ -235,7 +235,7 @@ class ProjectEditorWindow: NSObject, NSWindowDelegate {
         }
 
         let browseButton = NSButton(frame: NSRect(x: fieldX + fieldWidth - 44, y: currentY - 3, width: 44, height: 26))
-        browseButton.title = "..."
+        browseButton.title = "…"
         browseButton.bezelStyle = .rounded
         browseButton.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         browseButton.target = self
@@ -1002,14 +1002,12 @@ enum MainWindowTab: String, CaseIterable {
     case projects = "Projects"
     case activity = "Activity"
     case help = "Help"
-    case settings = "Settings"
 
     var sfSymbol: String {
         switch self {
         case .projects: return "list.bullet.rectangle"
         case .activity: return "text.alignleft"
         case .help: return "questionmark.circle"
-        case .settings: return "gearshape"
         }
     }
 }
@@ -1487,7 +1485,7 @@ class ProjectDetailWindow: NSObject, NSWindowDelegate {
 /// NSTabViewController because the parent project doesn't use view
 /// controllers and the visual design we want (sidebar selection driving
 /// the right pane) is simpler with manual view swapping.
-class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     static let frameAutosaveName = "com.harbr.app.mainWindow"
     static let lastTabDefaultsKey = "com.harbr.app.mainWindowLastTab"
 
@@ -1501,6 +1499,7 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     // Projects tab
     private var projectsTable: NSTableView?
     private var healthBanner: NSTextField?
+    private var projectsEmptyState: NSView?
 
     // Activity tab
     private var activityProjectList: NSTableView?
@@ -1508,12 +1507,8 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
     private var activityRefreshTimer: Timer?
     private var activitySelectedPort: Int?
 
-    // Settings tab
-    private var terminalPopup: NSPopUpButton?
-    private var multiLaunchLayoutPopup: NSPopUpButton?
-    private var notificationsCheckbox: NSButton?
-    private var launchAtLoginCheckbox: NSButton?
-    private var captureLogsDefaultLabel: NSTextField?
+    // Settings moved to a standalone SettingsWindowController — no
+    // per-tab state lives here anymore.
 
     // Currently open per-project detail sheet, retained here so the sheet
     // outlives the table click that opened it.
@@ -1685,7 +1680,6 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         case .projects: buildProjectsTab(in: container)
         case .activity: buildActivityTab(in: container)
         case .help: buildHelpTab(in: container)
-        case .settings: buildSettingsTab(in: container)
         }
     }
 
@@ -1802,10 +1796,89 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         }
         table.dataSource = self
         table.delegate = self
+        // Right-click context menu on rows. Populated dynamically in
+        // menuNeedsUpdate based on which row the user clicked so the menu
+        // reflects the target project's current running/stopped state.
+        let contextMenu = NSMenu()
+        contextMenu.delegate = self
+        table.menu = contextMenu
         tableScroll.documentView = table
         container.addSubview(tableScroll)
         self.projectsTable = table
+
+        // Empty-state overlay — a centered "No projects yet" message with a
+        // Scan Folder call-to-action, matching how Mail / Notes / Reminders
+        // fill an empty list view. Sits on top of the (empty) NSScrollView
+        // and is toggled hidden/visible from refreshProjectsEmptyState based
+        // on config.projects.count. Uses the same autoresizing mask as the
+        // scroll view so it tracks window resizes.
+        let emptyState = NSView(frame: tableScroll.frame)
+        emptyState.autoresizingMask = [.width, .height]
+
+        let iconView = NSImageView()
+        iconView.image = NSImage(systemSymbolName: "sailboat", accessibilityDescription: nil)
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 44, weight: .light)
+        iconView.contentTintColor = .tertiaryLabelColor
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.addSubview(iconView)
+
+        let headline = NSTextField(labelWithString: "No projects yet")
+        headline.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
+        headline.textColor = .secondaryLabelColor
+        headline.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.addSubview(headline)
+
+        let subhead = NSTextField(labelWithString: "Scan a folder to auto-detect dev servers, or add one manually.")
+        subhead.font = NSFont.systemFont(ofSize: 13)
+        subhead.textColor = .tertiaryLabelColor
+        subhead.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.addSubview(subhead)
+
+        let scanCTA = NSButton(title: "Scan Folder…", target: app, action: #selector(HarbrApp.scanForProjects))
+        scanCTA.bezelStyle = .rounded
+        if #available(macOS 11.0, *) { scanCTA.bezelColor = .controlAccentColor }
+        scanCTA.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.addSubview(scanCTA)
+
+        let addCTA = NSButton(title: "Add Project…", target: app, action: #selector(HarbrApp.addNewProject))
+        addCTA.bezelStyle = .rounded
+        addCTA.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.addSubview(addCTA)
+
+        NSLayoutConstraint.activate([
+            iconView.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            iconView.centerYAnchor.constraint(equalTo: emptyState.centerYAnchor, constant: -60),
+            iconView.widthAnchor.constraint(equalToConstant: 56),
+            iconView.heightAnchor.constraint(equalToConstant: 56),
+
+            headline.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            headline.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 12),
+
+            subhead.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            subhead.topAnchor.constraint(equalTo: headline.bottomAnchor, constant: 6),
+
+            scanCTA.trailingAnchor.constraint(equalTo: emptyState.centerXAnchor, constant: -6),
+            scanCTA.topAnchor.constraint(equalTo: subhead.bottomAnchor, constant: 18),
+
+            addCTA.leadingAnchor.constraint(equalTo: emptyState.centerXAnchor, constant: 6),
+            addCTA.centerYAnchor.constraint(equalTo: scanCTA.centerYAnchor),
+        ])
+
+        container.addSubview(emptyState)
+        self.projectsEmptyState = emptyState
+
         table.reloadData()
+        refreshProjectsEmptyState()
+    }
+
+    /// Show or hide the projects-tab empty-state overlay based on whether
+    /// there are any projects to render. Called after every reloadData of
+    /// the projects table so add/scan/delete flip the state within the
+    /// next poll tick.
+    @MainActor private func refreshProjectsEmptyState() {
+        let isEmpty = (app?.config?.projects.isEmpty) ?? true
+        projectsEmptyState?.isHidden = !isEmpty
+        projectsTable?.enclosingScrollView?.isHidden = isEmpty
     }
 
     @MainActor private func projectsCellView(forColumn id: String, row: Int) -> NSView? {
@@ -2053,6 +2126,77 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         guard let project = projectForMenuItem(sender) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("http://localhost:\(project.port)", forType: .string)
+    }
+
+    // MARK: Row context menu
+
+    /// Lifecycle handlers for the right-click context menu. Named
+    /// distinctly from the *FromTable button handlers because those take
+    /// NSButton (with .tag = row) whereas context-menu items are
+    /// NSMenuItem (with .representedObject = row). Behaviorally identical.
+    @MainActor @objc private func startFromContext(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        app?.startProjectDirectly(project)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.projectsTable?.reloadData()
+        }
+    }
+
+    @MainActor @objc private func stopFromContext(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        app?.stopProjectByPort(project.port)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.projectsTable?.reloadData()
+        }
+    }
+
+    @MainActor @objc private func restartFromContext(_ sender: NSMenuItem) {
+        guard let project = projectForMenuItem(sender) else { return }
+        app?.restartProjectDirectly(project)
+    }
+
+    // NSMenuDelegate — repopulates the projects-table row context menu
+    // right before it opens so the items reflect the *clicked* row's
+    // current state (running vs stopped changes which lifecycle verbs
+    // appear).
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === projectsTable?.menu else { return }
+        menu.removeAllItems()
+
+        let row = projectsTable?.clickedRow ?? -1
+        guard row >= 0, let project = app?.config?.projects[safe: row] else {
+            // Empty right-click zone (below the last row). Suppress the
+            // menu by leaving it empty; NSTableView won't display an
+            // itemless menu.
+            return
+        }
+
+        let active = app?.portStatusCache[project.port]?.isActive ?? false
+
+        func addItem(_ title: String, _ selector: Selector, symbol: String? = nil) {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            item.target = self
+            item.representedObject = row
+            if let symbol {
+                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            }
+            menu.addItem(item)
+        }
+
+        if active {
+            addItem("Stop", #selector(stopFromContext(_:)), symbol: "stop.fill")
+            addItem("Restart", #selector(restartFromContext(_:)), symbol: "arrow.clockwise")
+        } else {
+            addItem("Start", #selector(startFromContext(_:)), symbol: "play.fill")
+        }
+        menu.addItem(.separator())
+        addItem("Open in Finder", #selector(openFinderFromTable(_:)), symbol: "folder")
+        addItem("Open in Terminal", #selector(openTerminalFromTable(_:)), symbol: "terminal")
+        addItem("Open in Browser", #selector(openBrowserFromTable(_:)), symbol: "safari")
+        addItem("Copy URL", #selector(copyUrlFromTable(_:)), symbol: "doc.on.doc")
+        menu.addItem(.separator())
+        addItem("Edit…", #selector(editFromTable(_:)), symbol: "pencil")
+        addItem("Delete…", #selector(deleteFromTable(_:)), symbol: "trash")
     }
 
     // MARK: Activity tab
@@ -2424,165 +2568,13 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         return row
     }
 
-    // MARK: Settings tab
-
-    @MainActor private func buildSettingsTab(in container: NSView) {
-        let bounds = container.bounds
-
-        let title = NSTextField(labelWithString: "Settings")
-        title.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
-        title.frame = NSRect(x: 20, y: bounds.height - 44, width: 200, height: 28)
-        title.autoresizingMask = [.minYMargin]
-        container.addSubview(title)
-
-        var y: CGFloat = bounds.height - 90
-
-        // Terminal app
-        let terminalLabel = NSTextField(labelWithString: "Open dev servers in:")
-        terminalLabel.frame = NSRect(x: 20, y: y, width: 160, height: 20)
-        terminalLabel.autoresizingMask = [.minYMargin]
-        container.addSubview(terminalLabel)
-
-        let terminalPopup = NSPopUpButton(frame: NSRect(x: 190, y: y - 4, width: 180, height: 26))
-        for terminal in TerminalApp.allCases {
-            let title = terminal.isInstalled ? terminal.displayName : "\(terminal.displayName) (not installed)"
-            terminalPopup.addItem(withTitle: title)
-            terminalPopup.lastItem?.isEnabled = terminal.isInstalled
-            terminalPopup.lastItem?.representedObject = terminal
-        }
-        let current = app?.config?.terminal ?? .terminal
-        if let idx = TerminalApp.allCases.firstIndex(of: current) {
-            terminalPopup.selectItem(at: idx)
-        }
-        terminalPopup.target = self
-        terminalPopup.action = #selector(terminalPopupChanged(_:))
-        terminalPopup.autoresizingMask = [.minYMargin]
-        container.addSubview(terminalPopup)
-        self.terminalPopup = terminalPopup
-
-        y -= 44
-
-        // Multi-launch layout: how Start All spreads spawns across windows/tabs.
-        let layoutLabel = NSTextField(labelWithString: "Start All layout:")
-        layoutLabel.frame = NSRect(x: 20, y: y, width: 160, height: 20)
-        layoutLabel.autoresizingMask = [.minYMargin]
-        container.addSubview(layoutLabel)
-
-        let layoutPopup = NSPopUpButton(frame: NSRect(x: 190, y: y - 4, width: 220, height: 26))
-        for layout in MultiLaunchLayout.allCases {
-            layoutPopup.addItem(withTitle: layout.displayName)
-            layoutPopup.lastItem?.representedObject = layout
-        }
-        let currentLayout = app?.config?.multiLaunchLayout ?? .separateWindows
-        if let idx = MultiLaunchLayout.allCases.firstIndex(of: currentLayout) {
-            layoutPopup.selectItem(at: idx)
-        }
-        layoutPopup.target = self
-        layoutPopup.action = #selector(multiLaunchLayoutPopupChanged(_:))
-        layoutPopup.autoresizingMask = [.minYMargin]
-        container.addSubview(layoutPopup)
-        self.multiLaunchLayoutPopup = layoutPopup
-
-        y -= 18
-
-        let layoutHint = NSTextField(labelWithString: "Single Start clicks always open a new window. Warp always uses new windows.")
-        layoutHint.font = NSFont.systemFont(ofSize: 10)
-        layoutHint.textColor = .tertiaryLabelColor
-        layoutHint.frame = NSRect(x: 40, y: y, width: bounds.width - 60, height: 16)
-        layoutHint.autoresizingMask = [.minYMargin, .width]
-        container.addSubview(layoutHint)
-
-        y -= 32
-
-        // Notifications
-        let notif = NSButton(checkboxWithTitle: "Show notifications when servers start, stop, or auto-restart",
-                             target: self, action: #selector(notificationsToggled))
-        notif.frame = NSRect(x: 20, y: y, width: 500, height: 22)
-        notif.state = (app?.config?.notifications ?? true) ? .on : .off
-        notif.autoresizingMask = [.minYMargin]
-        container.addSubview(notif)
-        self.notificationsCheckbox = notif
-
-        y -= 32
-
-        // Launch at login
-        let launch = NSButton(checkboxWithTitle: "Launch Harbr automatically when I log in",
-                              target: self, action: #selector(launchAtLoginToggled))
-        launch.frame = NSRect(x: 20, y: y, width: 500, height: 22)
-        launch.state = (app?.config?.launchAtLogin ?? false) ? .on : .off
-        launch.autoresizingMask = [.minYMargin]
-        container.addSubview(launch)
-        self.launchAtLoginCheckbox = launch
-
-        y -= 18
-
-        let launchHint = NSTextField(labelWithString: "Takes effect at your next login.")
-        launchHint.font = NSFont.systemFont(ofSize: 10)
-        launchHint.textColor = .tertiaryLabelColor
-        launchHint.frame = NSRect(x: 40, y: y, width: 400, height: 16)
-        launchHint.autoresizingMask = [.minYMargin]
-        container.addSubview(launchHint)
-
-        y -= 34
-
-        // Info row about log capture
-        let infoTitle = NSTextField(labelWithString: "Log capture")
-        infoTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        infoTitle.frame = NSRect(x: 20, y: y, width: 200, height: 20)
-        infoTitle.autoresizingMask = [.minYMargin]
-        container.addSubview(infoTitle)
-
-        y -= 24
-
-        let infoBody = NSTextField(wrappingLabelWithString: "Harbr wraps each dev server with /usr/bin/script so its output is saved to ~/.harbr/logs/<port>.log and shown in the Activity tab. Turn it off per project in the project's editor if you have something that needs an unwrapped command (rare).")
-        infoBody.font = NSFont.systemFont(ofSize: 11)
-        infoBody.textColor = .secondaryLabelColor
-        infoBody.frame = NSRect(x: 20, y: y - 40, width: bounds.width - 40, height: 60)
-        infoBody.autoresizingMask = [.minYMargin, .width]
-        container.addSubview(infoBody)
-        self.captureLogsDefaultLabel = infoBody
-
-        y -= 80
-
-        // About
-        let about = NSTextField(labelWithString: "Harbr · github.com/athayworth/Harbr")
-        about.font = NSFont.systemFont(ofSize: 10)
-        about.textColor = .tertiaryLabelColor
-        about.frame = NSRect(x: 20, y: 20, width: bounds.width - 40, height: 16)
-        about.autoresizingMask = [.maxYMargin]
-        container.addSubview(about)
-    }
-
-    @MainActor @objc private func terminalPopupChanged(_ sender: NSPopUpButton) {
-        guard let selected = sender.selectedItem?.representedObject as? TerminalApp else { return }
-        app?.config?.terminal = selected
-        app?.saveConfig()
-    }
-
-    @MainActor @objc private func multiLaunchLayoutPopupChanged(_ sender: NSPopUpButton) {
-        guard let selected = sender.selectedItem?.representedObject as? MultiLaunchLayout else { return }
-        app?.config?.multiLaunchLayout = selected
-        app?.saveConfig()
-    }
-
-    @MainActor @objc private func notificationsToggled() {
-        let value = notificationsCheckbox?.state == .on
-        app?.config?.notifications = value
-        app?.saveConfig()
-    }
-
-    @MainActor @objc private func launchAtLoginToggled() {
-        let value = launchAtLoginCheckbox?.state == .on
-        guard let current = app?.config?.launchAtLogin, current != value else { return }
-        app?.toggleLaunchAtLogin()
-    }
-
     // MARK: Refresh hook (called from app's poll)
 
     @MainActor func reloadFromPoll() {
         // Avoid touching tables for tabs that aren't on screen.
         if currentTab == .projects {
             projectsTable?.reloadData()
+            refreshProjectsEmptyState()
             refreshHealthBanner()
         }
         if currentTab == .activity {
@@ -2644,10 +2636,6 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         banner.backgroundColor = bg
     }
 
-    /// Public entry point so the ⌘, menu item can open the window directly
-    /// to Settings instead of whatever tab was last viewed.
-    @MainActor func switchToSettings() { switchTo(.settings) }
-
     /// Switch to the Activity tab and focus the log stream on a specific
     /// project's port. Called from the per-project detail sheet's
     /// "View Logs" action so the user can keep reading without re-finding
@@ -2680,6 +2668,211 @@ class HarbrMainWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTabl
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
+    }
+}
+
+// MARK: - Settings Window
+
+/// Standalone Settings window. Was previously a tab inside the main
+/// window, but ⌘, opening a dedicated settings window is the Mac-native
+/// pattern (TextEdit, Notes, Xcode). Fixed size, no toolbar — a single
+/// pane of options doesn't justify the Xcode-style segmented toolbar.
+/// If settings grow past one screen we can add a toolbar and split panes.
+class SettingsWindowController: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    weak var app: HarbrApp?
+    var onDismiss: (() -> Void)?
+    private var didDismiss = false
+
+    // Controls held so future config-external updates (e.g. Launch at
+    // Login being flipped by another surface) can push their new value
+    // back into the UI. Terminal / layout popups also need refs to
+    // resolve which case the user picked in the target/action callback.
+    private var terminalPopup: NSPopUpButton?
+    private var multiLaunchLayoutPopup: NSPopUpButton?
+    private var notificationsCheckbox: NSButton?
+    private var launchAtLoginCheckbox: NSButton?
+
+    @MainActor init(app: HarbrApp) {
+        self.app = app
+        super.init()
+    }
+
+    @MainActor func show() {
+        if window == nil {
+            buildWindow()
+        }
+        // LSUIElement apps don't auto-activate when a window is asked to
+        // come forward from a status-bar action; force it so the window
+        // isn't buried behind other apps.
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    @MainActor func closeSilently() {
+        onDismiss = nil
+        window?.close()
+    }
+
+    @MainActor private func buildWindow() {
+        let size = NSSize(width: 480, height: 400)
+        let win = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        // Modern Mac Settings windows are titled "Settings" on macOS 13+
+        // and "Preferences" on 12 — match the OS-wide rename.
+        if #available(macOS 13.0, *) {
+            win.title = "Settings"
+        } else {
+            win.title = "Preferences"
+        }
+        win.center()
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+
+        let container = NSView(frame: NSRect(origin: .zero, size: size))
+        buildContent(in: container)
+        win.contentView = container
+        window = win
+    }
+
+    @MainActor private func buildContent(in container: NSView) {
+        let bounds = container.bounds
+        var y = bounds.height - 40
+
+        // Terminal app
+        let terminalLabel = NSTextField(labelWithString: "Open dev servers in:")
+        terminalLabel.frame = NSRect(x: 24, y: y, width: 170, height: 20)
+        container.addSubview(terminalLabel)
+
+        let terminalPopup = NSPopUpButton(frame: NSRect(x: 200, y: y - 4, width: 200, height: 26))
+        for terminal in TerminalApp.allCases {
+            let title = terminal.isInstalled ? terminal.displayName : "\(terminal.displayName) (not installed)"
+            terminalPopup.addItem(withTitle: title)
+            terminalPopup.lastItem?.isEnabled = terminal.isInstalled
+            terminalPopup.lastItem?.representedObject = terminal
+        }
+        let current = app?.config?.terminal ?? .terminal
+        if let idx = TerminalApp.allCases.firstIndex(of: current) {
+            terminalPopup.selectItem(at: idx)
+        }
+        terminalPopup.target = self
+        terminalPopup.action = #selector(terminalPopupChanged(_:))
+        container.addSubview(terminalPopup)
+        self.terminalPopup = terminalPopup
+        y -= 44
+
+        // Multi-launch layout
+        let layoutLabel = NSTextField(labelWithString: "Start All layout:")
+        layoutLabel.frame = NSRect(x: 24, y: y, width: 170, height: 20)
+        container.addSubview(layoutLabel)
+
+        let layoutPopup = NSPopUpButton(frame: NSRect(x: 200, y: y - 4, width: 220, height: 26))
+        for layout in MultiLaunchLayout.allCases {
+            layoutPopup.addItem(withTitle: layout.displayName)
+            layoutPopup.lastItem?.representedObject = layout
+        }
+        let currentLayout = app?.config?.multiLaunchLayout ?? .separateWindows
+        if let idx = MultiLaunchLayout.allCases.firstIndex(of: currentLayout) {
+            layoutPopup.selectItem(at: idx)
+        }
+        layoutPopup.target = self
+        layoutPopup.action = #selector(multiLaunchLayoutPopupChanged(_:))
+        container.addSubview(layoutPopup)
+        self.multiLaunchLayoutPopup = layoutPopup
+
+        y -= 18
+        let layoutHint = NSTextField(labelWithString: "Single Start clicks always open a new window. Warp always uses new windows.")
+        layoutHint.font = NSFont.systemFont(ofSize: 10)
+        layoutHint.textColor = .tertiaryLabelColor
+        layoutHint.frame = NSRect(x: 44, y: y, width: bounds.width - 68, height: 16)
+        container.addSubview(layoutHint)
+
+        y -= 34
+
+        // Notifications
+        let notif = NSButton(checkboxWithTitle: "Show notifications when servers start, stop, or auto-restart",
+                             target: self, action: #selector(notificationsToggled))
+        notif.frame = NSRect(x: 24, y: y, width: bounds.width - 48, height: 22)
+        notif.state = (app?.config?.notifications ?? true) ? .on : .off
+        container.addSubview(notif)
+        self.notificationsCheckbox = notif
+
+        y -= 32
+
+        // Launch at login
+        let launch = NSButton(checkboxWithTitle: "Launch Harbr automatically when I log in",
+                              target: self, action: #selector(launchAtLoginToggled))
+        launch.frame = NSRect(x: 24, y: y, width: bounds.width - 48, height: 22)
+        launch.state = (app?.config?.launchAtLogin ?? false) ? .on : .off
+        container.addSubview(launch)
+        self.launchAtLoginCheckbox = launch
+
+        y -= 18
+        let launchHint = NSTextField(labelWithString: "Takes effect at your next login.")
+        launchHint.font = NSFont.systemFont(ofSize: 10)
+        launchHint.textColor = .tertiaryLabelColor
+        launchHint.frame = NSRect(x: 44, y: y, width: 400, height: 16)
+        container.addSubview(launchHint)
+
+        y -= 34
+
+        // Log capture info block
+        let infoTitle = NSTextField(labelWithString: "Log capture")
+        infoTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        infoTitle.frame = NSRect(x: 24, y: y, width: 200, height: 20)
+        container.addSubview(infoTitle)
+
+        y -= 24
+        let infoBody = NSTextField(wrappingLabelWithString: "Harbr wraps each dev server with /usr/bin/script so its output is saved to ~/.harbr/logs/<port>.log and shown in the Activity tab. Turn it off per project in the project's editor if you have something that needs an unwrapped command (rare).")
+        infoBody.font = NSFont.systemFont(ofSize: 11)
+        infoBody.textColor = .secondaryLabelColor
+        infoBody.frame = NSRect(x: 24, y: y - 44, width: bounds.width - 48, height: 60)
+        container.addSubview(infoBody)
+
+        // About footer
+        let about = NSTextField(labelWithString: "Harbr · github.com/athayworth/Harbr")
+        about.font = NSFont.systemFont(ofSize: 10)
+        about.textColor = .tertiaryLabelColor
+        about.frame = NSRect(x: 24, y: 16, width: bounds.width - 48, height: 16)
+        container.addSubview(about)
+    }
+
+    // MARK: Handlers
+
+    @MainActor @objc private func terminalPopupChanged(_ sender: NSPopUpButton) {
+        guard let selected = sender.selectedItem?.representedObject as? TerminalApp else { return }
+        app?.config?.terminal = selected
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func multiLaunchLayoutPopupChanged(_ sender: NSPopUpButton) {
+        guard let selected = sender.selectedItem?.representedObject as? MultiLaunchLayout else { return }
+        app?.config?.multiLaunchLayout = selected
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func notificationsToggled() {
+        let value = notificationsCheckbox?.state == .on
+        app?.config?.notifications = value
+        app?.saveConfig()
+    }
+
+    @MainActor @objc private func launchAtLoginToggled() {
+        let value = launchAtLoginCheckbox?.state == .on
+        guard let current = app?.config?.launchAtLogin, current != value else { return }
+        app?.toggleLaunchAtLogin()
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowWillClose(_ notification: Notification) {
+        guard !didDismiss else { return }
+        didDismiss = true
+        onDismiss?()
     }
 }
 
@@ -2782,6 +2975,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentEditorWindow: ProjectEditorWindow?
     var currentScannerWindow: ProjectScannerWindow?
     var currentMainWindow: HarbrMainWindow?
+    var currentSettingsWindow: SettingsWindowController?
     var previousPortStates: [Int: Bool] = [:]
     var notificationsAuthorized = false
     /// Tracks ports that were intentionally stopped by user (to avoid auto-restart)
@@ -4116,7 +4310,7 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         scanProjectsItem.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
         menu.addItem(scanProjectsItem)
 
-        let addProjectItem = NSMenuItem(title: "Add Project...", action: #selector(addNewProject), keyEquivalent: "n")
+        let addProjectItem = NSMenuItem(title: "Add Project…", action: #selector(addNewProject), keyEquivalent: "n")
         addProjectItem.target = self
         addProjectItem.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
         menu.addItem(addProjectItem)
@@ -4126,8 +4320,17 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reloadItem.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
         menu.addItem(reloadItem)
 
-        // Preferences submenu
-        let prefsItem = NSMenuItem(title: "Preferences", action: nil, keyEquivalent: ",")
+        // Preferences submenu — renamed to "Settings" on macOS 13+ (Ventura)
+        // to match Apple's system-wide rename. macOS 12 still says
+        // "Preferences" everywhere in its own UI so we keep the older label
+        // there for consistency with the rest of that OS's chrome.
+        let prefsTitle: String
+        if #available(macOS 13.0, *) {
+            prefsTitle = "Settings"
+        } else {
+            prefsTitle = "Preferences"
+        }
+        let prefsItem = NSMenuItem(title: prefsTitle, action: nil, keyEquivalent: ",")
         prefsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         let prefsSubmenu = NSMenu()
 
@@ -4596,13 +4799,13 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         submenu.addItem(NSMenuItem.separator())
 
-        let editItem = NSMenuItem(title: "Edit...", action: #selector(editProject(_:)), keyEquivalent: "")
+        let editItem = NSMenuItem(title: "Edit…", action: #selector(editProject(_:)), keyEquivalent: "")
         editItem.representedObject = project
         editItem.target = self
         editItem.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil)
         submenu.addItem(editItem)
 
-        let deleteItem = NSMenuItem(title: "Delete...", action: #selector(deleteProject(_:)), keyEquivalent: "")
+        let deleteItem = NSMenuItem(title: "Delete…", action: #selector(deleteProject(_:)), keyEquivalent: "")
         deleteItem.representedObject = project
         deleteItem.target = self
         deleteItem.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
@@ -5240,8 +5443,22 @@ class HarbrApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor @objc func openSettingsWindow() {
-        openMainWindow()
-        currentMainWindow?.switchToSettings()
+        // Standalone Settings window (macOS-native pattern). Reuses the
+        // same instance across invocations so ⌘, toggling doesn't stack
+        // windows. Nils out on close via onDismiss with an identity check
+        // that mirrors the editor/scanner window pattern — see comments
+        // in openMainWindow for why the identity check matters.
+        if currentSettingsWindow == nil {
+            let controller = SettingsWindowController(app: self)
+            currentSettingsWindow = controller
+            currentSettingsWindow?.onDismiss = { [weak self, weak controller] in
+                DispatchQueue.main.async {
+                    guard self?.currentSettingsWindow === controller else { return }
+                    self?.currentSettingsWindow = nil
+                }
+            }
+        }
+        currentSettingsWindow?.show()
     }
 
     @MainActor @objc func openMainWindow() {
